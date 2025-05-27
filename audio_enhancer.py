@@ -35,6 +35,76 @@ def setup_logging(verbose=False):
     
     return logger
 
+def resample_audio(input_path: str, target_sr: int = 16000, logger=None) -> str:
+    """
+    Rééchantillonne un fichier audio à une fréquence cible.
+    
+    Args:
+        input_path: chemin vers le fichier audio d'entrée
+        target_sr: fréquence d'échantillonnage cible (défaut: 16000 Hz)
+        logger: logger pour les messages
+    
+    Returns:
+        str: chemin vers le fichier rééchantillonné
+    """
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    output_path = os.path.join('resampled_files', f'{base_name}.wav')
+    
+    try:
+        if logger:
+            logger.info(f"Rééchantillonnage de {input_path} vers {target_sr} Hz")
+        
+        audio, sr = librosa.load(input_path, sr=None)
+        
+        if sr != target_sr:
+            resampled_audio = librosa.resample(y=audio, orig_sr=sr, target_sr=target_sr)
+            if logger:
+                logger.info(f"Audio rééchantillonné de {sr} Hz vers {target_sr} Hz")
+        else:
+            resampled_audio = audio
+            if logger:
+                logger.info(f"Audio déjà à {target_sr} Hz, aucun rééchantillonnage nécessaire")
+        
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        sf.write(output_path, resampled_audio, target_sr)
+        
+        if logger:
+            logger.info(f"Fichier rééchantillonné sauvegardé: {output_path}")
+        
+        return output_path
+    except Exception as e:
+        raise RuntimeError(f"Échec du rééchantillonnage: {e}")
+
+def convert_to_wav(input_path: str, target_sr: int = 16000, logger=None) -> str:
+    """
+    Convertit un fichier audio au format WAV.
+    
+    Args:
+        input_path: chemin vers le fichier audio d'entrée
+        target_sr: fréquence d'échantillonnage cible (défaut: 16000 Hz)
+        logger: logger pour les messages
+    
+    Returns:
+        str: chemin vers le fichier WAV converti
+    """
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    output_path = os.path.join('converted_files', f'{base_name}.wav')
+    
+    try:
+        if logger:
+            logger.info(f"Conversion de {input_path} vers format WAV")
+        
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        audio, sr = librosa.load(input_path, sr=target_sr)
+        sf.write(output_path, audio, target_sr)
+        
+        if logger:
+            logger.info(f"Fichier converti sauvegardé: {output_path}")
+        
+        return output_path
+    except Exception as e:
+        raise RuntimeError(f"Échec de la conversion WAV: {e}")
+
 # Ajoutons une fonction de compression dynamique pour rehausser les voix faibles tout en évitant la distorsion
 def dynamic_range_compression(y, sr, threshold_db=-30, ratio=4.0, attack_ms=5.0, release_ms=50.0, logger=None):
     """
@@ -260,6 +330,12 @@ def main():
     parser.add_argument('--export-json', '-j', action='store_true',
                        help='Exporter les métadonnées au format JSON')
     
+    # Nouvelles options pour preprocessing
+    parser.add_argument('--target-sr', type=int, default=16000,
+                       help='Fréquence d\'échantillonnage cible pour le preprocessing (défaut: 16000)')
+    parser.add_argument('--skip-preprocessing', action='store_true',
+                       help='Ignorer les étapes de preprocessing (conversion et rééchantillonnage)')
+    
     args = parser.parse_args()
     
     logger = setup_logging(args.verbose)
@@ -270,9 +346,30 @@ def main():
         args.output = f"{base}_enhanced{ext}"
     
     try:
-        # Traitement audio amélioré
-        logger.info(f"Traitement de {args.input}")
-        y, sr = librosa.load(args.input, sr=None)
+        input_file = args.input
+        
+        # Étape 1: Preprocessing (conversion et rééchantillonnage) si nécessaire
+        if not args.skip_preprocessing:
+            logger.info("=== ÉTAPE 1: PREPROCESSING ===")
+            
+            # Convertir au format WAV si nécessaire
+            file_ext = os.path.splitext(args.input)[1].lower()
+            if file_ext != '.wav':
+                logger.info(f"Conversion du fichier {file_ext} vers WAV")
+                input_file = convert_to_wav(args.input, target_sr=args.target_sr, logger=logger)
+            else:
+                # Vérifier si rééchantillonnage nécessaire
+                y_check, sr_check = librosa.load(args.input, sr=None)
+                if sr_check != args.target_sr:
+                    logger.info(f"Rééchantillonnage nécessaire: {sr_check} Hz -> {args.target_sr} Hz")
+                    input_file = resample_audio(args.input, target_sr=args.target_sr, logger=logger)
+                else:
+                    logger.info(f"Fichier déjà au bon format et fréquence ({args.target_sr} Hz)")
+        
+        # Étape 2: Traitement d'amélioration audio
+        logger.info("=== ÉTAPE 2: AMÉLIORATION AUDIO ===")
+        logger.info(f"Traitement de {input_file}")
+        y, sr = librosa.load(input_file, sr=None)
         
         # Appliquer le traitement standard amélioré
         y_enhanced = process_standard_improved(
@@ -284,8 +381,9 @@ def main():
         sf.write(args.output, y_enhanced, sr)
         logger.info(f"Audio amélioré sauvegardé dans {args.output}")
         
-        # Transcription si demandée
+        # Étape 3: Transcription si demandée
         if args.transcribe:
+            logger.info("=== ÉTAPE 3: TRANSCRIPTION ===")
             logger.info("Transcription en cours...")
             transcript_path = f"{os.path.splitext(args.output)[0]}_transcript.txt"
             output_json = f"{os.path.splitext(args.output)[0]}_transcript.json" if args.export_json else None
@@ -301,7 +399,7 @@ def main():
             if args.export_json:
                 logger.info(f"Métadonnées de transcription sauvegardées dans {output_json}")
         
-        logger.info("Traitement terminé avec succès")
+        logger.info("=== TRAITEMENT TERMINÉ AVEC SUCCÈS ===")
         
     except Exception as e:
         logger.error(f"Erreur lors du traitement: {str(e)}")

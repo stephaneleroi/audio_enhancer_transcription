@@ -152,17 +152,58 @@ def format_value(value, format_str=".2f"):
     except (ValueError, TypeError):
         return str(value)
 
-def save_results(original_text: str, enhanced_text: str, metrics: Dict, output_dir: str):
+def save_results(original_text: str, enhanced_text: str, metrics: Dict, output_dir: str, original_file: str = None, enhanced_file: str = None):
     """
     Sauvegarde les résultats dans un fichier unique avec les indices de confiance.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
+    # Génération du nom de fichier basé sur le fichier original
+    if original_file:
+        original_name = Path(original_file).stem  # nom sans extension
+        output_filename = f"transcription_comparison_{original_name}.txt"
+    else:
+        output_filename = "transcription_comparison.txt"
+    
     # Sauvegarde des transcriptions avec indices de confiance
-    with open(output_path / "transcription_comparison.txt", "w", encoding="utf-8") as f:
+    with open(output_path / output_filename, "w", encoding="utf-8") as f:
+        f.write("RAPPORT D'ÉVALUATION D'AMÉLIORATION AUDIO\n")
+        f.write("=" * 50 + "\n\n")
+        
+        # Informations sur les fichiers
+        f.write("INFORMATIONS DES FICHIERS :\n")
+        f.write("-" * 30 + "\n")
+        if original_file:
+            f.write(f"Fichier original : {Path(original_file).name}\n")
+            f.write(f"Chemin complet   : {original_file}\n")
+        if enhanced_file:
+            f.write(f"Fichier amélioré : {Path(enhanced_file).name}\n")
+            f.write(f"Chemin complet   : {enhanced_file}\n")
+        f.write("\n")
+        
+        # Statistiques générales
+        f.write("STATISTIQUES GÉNÉRALES :\n")
+        f.write("-" * 25 + "\n")
+        f.write(f"Durée originale      : {format_value(metrics.get('original_duration', 0), '.2f')} secondes\n")
+        f.write(f"Durée améliorée      : {format_value(metrics.get('enhanced_duration', 0), '.2f')} secondes\n")
+        f.write(f"Segments originaux   : {metrics.get('original_segments', 0)}\n")
+        f.write(f"Segments améliorés   : {metrics.get('enhanced_segments', 0)}\n")
+        
+        if 'confidence_improvement_percent' in metrics:
+            f.write(f"Amélioration confiance : {format_value(metrics['confidence_improvement_percent'])}%\n")
+        
+        if 'confidence_stats' in metrics:
+            f.write(f"\nConfiance moyenne originale : {format_value(metrics['confidence_stats']['original']['mean'])}\n")
+            f.write(f"Confiance moyenne améliorée : {format_value(metrics['confidence_stats']['enhanced']['mean'])}\n")
+        
+        f.write("\n" + "=" * 50 + "\n\n")
+        
         f.write("TRANSCRIPTION ORIGINALE :\n")
-        f.write("=======================\n")
+        f.write("=" * 25 + "\n")
+        if original_file:
+            f.write(f"Source : {Path(original_file).name}\n\n")
+        
         for segment in metrics.get('original_segments_details', []):
             confidence = segment.get('confidence', 0)
             start_time = format_value(segment.get('start', 0), '.1f')
@@ -170,8 +211,12 @@ def save_results(original_text: str, enhanced_text: str, metrics: Dict, output_d
             f.write(f"[{start_time}s -> {end_time}s] (confiance: {format_value(confidence, '.4f')})\n")
             f.write(f"{segment.get('text', '')}\n\n")
         
-        f.write("\nTRANSCRIPTION AMÉLIORÉE :\n")
-        f.write("=======================\n")
+        f.write("\n" + "=" * 50 + "\n\n")
+        f.write("TRANSCRIPTION AMÉLIORÉE :\n")
+        f.write("=" * 27 + "\n")
+        if enhanced_file:
+            f.write(f"Source : {Path(enhanced_file).name}\n\n")
+        
         for segment in metrics.get('enhanced_segments_details', []):
             confidence = segment.get('confidence', 0)
             start_time = format_value(segment.get('start', 0), '.1f')
@@ -216,7 +261,8 @@ def main():
         metrics = analyze_transcriptions(original_meta, enhanced_meta)
         
         # Sauvegarde des résultats
-        save_results(original_text, enhanced_text, metrics, args.output_dir)
+        save_results(original_text, enhanced_text, metrics, args.output_dir, 
+                    original_file=args.original, enhanced_file=args.enhanced)
         
         # Affichage des métriques principales
         logger.info("\nRésultats de l'évaluation :")
