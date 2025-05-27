@@ -60,8 +60,8 @@ def transcribe_audio_improved(audio_path: str, model: Any = None, output_json=No
         best_of=5,             # Sélectionner la meilleure transcription parmi 5
         condition_on_previous_text=True,  # Utiliser le contexte précédent
         vad_parameters=dict(
-            min_silence_duration_ms=250,  # Détecter des silences plus courts
-            speech_pad_ms=150,           # Ajouter plus de contexte
+            min_silence_duration_ms=1000,  # Détecter des silences plus courts
+            speech_pad_ms=300,           # Ajouter plus de contexte
             threshold=0.30,              # Seuil plus bas pour détecter les voix faibles
         )
     )
