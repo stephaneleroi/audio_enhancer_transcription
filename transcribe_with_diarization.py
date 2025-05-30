@@ -33,23 +33,31 @@ def setup_logging(verbose=False):
 
 def run_audio_enhancement(input_file: str, logger=None):
     """
-    Étape 1: Pré-traitement audio adaptatif avec sauvegarde de l'analyse.
+    Étape 1: Pré-traitement audio adaptatif avec intensité intelligente.
     
-    Cette étape améliore la qualité audio ET sauvegarde l'analyse
-    pour optimiser les étapes suivantes (transcription et diarisation).
+    Cette étape améliore la qualité audio avec une intensité adaptée automatiquement
+    selon la qualité détectée, ET sauvegarde l'analyse pour optimiser les étapes suivantes.
+    
+    Intensités adaptatives :
+    - Haute qualité : 0.7 (traitement conservateur pour préserver la qualité)
+    - Qualité moyenne : 1.0 (traitement standard)
+    - Basse qualité : 1.3 (traitement plus agressif pour améliorer)
     """
     if logger:
-        logger.info("🔧 ÉTAPE 1: Pré-traitement audio adaptatif")
+        logger.info("🔧 ÉTAPE 1: Pré-traitement audio adaptatif intelligent")
     
     input_path = Path(input_file)
     enhanced_file = input_path.with_name(f"{input_path.stem}_adaptive_enhanced{input_path.suffix}")
     
-    # Commande avec sauvegarde de l'analyse
+    # NOUVEAU: Intensité adaptative selon la qualité détectée
+    # L'intensité sera ajustée automatiquement par audio_enhancer.py
+    # selon la qualité détectée lors de l'analyse
     cmd = [
         sys.executable, "audio_enhancer.py",
         str(input_file),
         "--output", str(enhanced_file),
-        "--save-analysis",  # NOUVEAU: Sauvegarde l'analyse pour les étapes suivantes
+        "--save-analysis",  # Sauvegarde l'analyse pour les étapes suivantes
+        "--intensity", "auto",  # NOUVEAU: Intensité automatique selon qualité
         "--verbose" if logger and logger.level == logging.DEBUG else ""
     ]
     

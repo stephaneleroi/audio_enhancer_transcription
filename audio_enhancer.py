@@ -107,7 +107,7 @@ def analyze_audio_characteristics(y: np.ndarray, sr: int, logger=None) -> Dict[s
         'duration': len(y) / sr,
         'sample_rate': sr
     }
-    
+        
     if logger:
         logger.info(f"📊 Analyse terminée en {time.time() - start_time:.2f}s")
         logger.info(f"   • Énergie moyenne: {mean_energy:.6f}")
@@ -127,9 +127,22 @@ def calculate_adaptive_parameters(characteristics: Dict[str, Any], logger=None) 
     
     Justification mathématique : Les formules utilisent des références calculées
     et des facteurs d'adaptation proportionnels aux caractéristiques détectées.
+    
+    MODIFICATION: Ajout d'un facteur de préservation de qualité adaptatif.
     """
     if logger:
         logger.info("🧮 Calcul des paramètres adaptatifs...")
+    
+    # NOUVEAU: Facteur de préservation de qualité
+    # Plus la qualité est bonne, moins on traite agressivement
+    quality_preservation_factor = {
+        'high': 0.7,    # Traitement très doux pour haute qualité
+        'medium': 0.85, # Traitement modéré
+        'low': 1.0      # Traitement normal pour basse qualité
+    }[characteristics['recording_quality']]
+    
+    if logger:
+        logger.info(f"   • Facteur préservation qualité: {quality_preservation_factor:.2f} ({characteristics['recording_quality']})")
     
     # Références énergétiques calculées automatiquement
     energy_reference = np.sqrt(characteristics['mean_energy']**2) * 0.2
@@ -152,35 +165,39 @@ def calculate_adaptive_parameters(characteristics: Dict[str, Any], logger=None) 
     very_weak_threshold_db = 20 * np.log10(max(very_weak_threshold_linear, 1e-10))
     
     # Calcul des gains adaptatifs selon la proportion de voix faibles
-    base_weak_boost = 2.0 + characteristics['weak_voice_ratio'] * 3.0  # 2.0 à 5.0
-    base_very_weak_boost = 3.0 + characteristics['very_weak_ratio'] * 4.0  # 3.0 à 7.0
+    base_weak_boost = 1.5 + characteristics['weak_voice_ratio'] * 2.0  # 1.5 à 3.5 (au lieu de 2.0 à 5.0)
+    base_very_weak_boost = 2.0 + characteristics['very_weak_ratio'] * 2.5  # 2.0 à 4.5 (au lieu de 3.0 à 7.0)
     
     # Ajustement selon la qualité d'enregistrement
     quality_multiplier = {
-        'low': 1.5,
-        'medium': 1.2,
-        'high': 1.0
+        'low': 1.3,      # Réduit de 1.5 à 1.3
+        'medium': 1.1,   # Réduit de 1.2 à 1.1
+        'high': 0.9      # Réduit de 1.0 à 0.9 pour préserver la qualité
     }[characteristics['recording_quality']]
     
     weak_boost = base_weak_boost * quality_multiplier * snr_factor
     very_weak_boost = base_very_weak_boost * quality_multiplier * snr_factor
     
-    # Bornes de sécurité calculées
-    weak_boost = max(1.5, min(8.0, weak_boost))
-    very_weak_boost = max(2.0, min(12.0, very_weak_boost))
+    # APPLICATION DU FACTEUR DE PRÉSERVATION DE QUALITÉ
+    weak_boost *= quality_preservation_factor
+    very_weak_boost *= quality_preservation_factor
+    
+    # Bornes de sécurité plus strictes
+    weak_boost = max(1.2, min(4.0, weak_boost))        # Réduit de [1.5, 8.0] à [1.2, 4.0]
+    very_weak_boost = max(1.5, min(6.0, very_weak_boost))  # Réduit de [2.0, 12.0] à [1.5, 6.0]
     
     # Paramètres de compression dynamique adaptatifs
     compression_threshold_db = weak_threshold_db - 5.0  # 5dB sous seuil faible
     compression_ratio = 2.0 + characteristics['dynamic_range'] * 10.0  # Adapté à la plage dynamique
     compression_ratio = max(1.5, min(6.0, compression_ratio))
     
-    # Paramètres de réduction de bruit adaptatifs
-    noise_reduction_factor = 1.0 + (1.0 - characteristics['snr_estimate'] / 30.0) * 2.0
-    noise_reduction_factor = max(0.8, min(3.0, noise_reduction_factor))
+    # Paramètres de réduction de bruit adaptatifs - PLUS CONSERVATEURS
+    noise_reduction_factor = 0.8 + (1.0 - characteristics['snr_estimate'] / 30.0) * 1.2  # Réduit de 2.0 à 1.2
+    noise_reduction_factor = max(0.6, min(2.0, noise_reduction_factor))  # Réduit max de 3.0 à 2.0
     
-    # Paramètres de clarté vocale adaptatifs
-    clarity_gain = 0.2 + characteristics['weak_voice_ratio'] * 0.6  # 0.2 à 0.8
-    clarity_threshold_db = weak_threshold_db + 5.0  # 5dB au-dessus seuil faible
+    # Paramètres de clarté vocale adaptatifs - PLUS DOUX
+    clarity_gain = 0.1 + characteristics['weak_voice_ratio'] * 0.3  # Réduit de 0.2-0.8 à 0.1-0.4
+    clarity_threshold_db = weak_threshold_db + 3.0  # Réduit de +5.0 à +3.0 dB
     
     # Fréquences de coupure adaptatives pour filtrage vocal
     # Basées sur le centroïde spectral mesuré
@@ -476,18 +493,24 @@ def adaptive_normalization(y: np.ndarray, characteristics: Dict[str, Any], logge
     
     return y_normalized
 
-def process_audio_adaptive(y: np.ndarray, sr: int, logger=None) -> np.ndarray:
+def process_audio_adaptive(y: np.ndarray, sr: int, intensity: float = 1.0, logger=None) -> np.ndarray:
     """
     Objectif : Pipeline de traitement audio entièrement adaptatif
     
     Applique une séquence de traitements avec des paramètres calculés automatiquement
     selon les caractéristiques du signal audio. Aucune valeur n'est codée en dur.
     
+    Args:
+        y: Signal audio
+        sr: Fréquence d'échantillonnage
+        intensity: Facteur d'intensité du traitement (0.5=doux, 1.0=normal, 1.5=agressif)
+        logger: Logger optionnel
+    
     Justification méthodologique : L'ordre des traitements est optimisé pour
     maximiser l'efficacité : réduction de bruit → amplification → compression → clarté.
     """
     if logger:
-        logger.info("🚀 Début du traitement audio adaptatif")
+        logger.info(f"🚀 Début du traitement audio adaptatif (intensité: {intensity:.1f})")
     
     start_time = time.time()
     
@@ -496,6 +519,15 @@ def process_audio_adaptive(y: np.ndarray, sr: int, logger=None) -> np.ndarray:
     
     # Étape 2 : Calcul des paramètres adaptatifs
     params = calculate_adaptive_parameters(characteristics, logger)
+    
+    # APPLICATION DU FACTEUR D'INTENSITÉ
+    if intensity != 1.0:
+        params['weak_boost'] = 1.0 + (params['weak_boost'] - 1.0) * intensity
+        params['very_weak_boost'] = 1.0 + (params['very_weak_boost'] - 1.0) * intensity
+        params['noise_reduction_factor'] = 1.0 + (params['noise_reduction_factor'] - 1.0) * intensity
+        params['clarity_gain'] *= intensity
+        if logger:
+            logger.info(f"   • Paramètres ajustés avec intensité {intensity:.1f}")
     
     # Étape 3 : Réduction de bruit adaptative
     y_processed = adaptive_spectral_subtraction(y, sr, params, logger=logger)
@@ -561,46 +593,66 @@ def main():
         description="Programme d'amélioration audio adaptatif - ZÉRO valeur codée en dur"
     )
     
-    parser.add_argument('input_file', help='Fichier audio à traiter')
+    parser.add_argument('input', help='Fichier audio à traiter')
     parser.add_argument('--output', '-o', help='Fichier de sortie (optionnel)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Affichage détaillé')
-    parser.add_argument('--target-sr', type=int, default=16000, 
+    parser.add_argument('--target-sr', type=int, default=16000,
                        help='Fréquence d\'échantillonnage cible (défaut: 16000)')
     parser.add_argument('--save-analysis', action='store_true', 
                        help='Sauvegarder l\'analyse audio en JSON')
+    parser.add_argument('--intensity', type=str, default="1.0",
+                       help='Intensité du traitement (0.5=doux, 1.0=normal, 1.5=agressif, auto=adaptatif)')
     
     args = parser.parse_args()
     
-    logger = setup_logging(args.verbose)
-    
-    # Génération automatique du nom de sortie
-    if not args.output:
-        base, ext = os.path.splitext(args.input_file)
-        args.output = f"{base}_adaptive_enhanced{ext}"
+    # Configuration du logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logger = setup_logging(log_level)
     
     try:
-        logger.info("=" * 60)
+        logger.info("============================================================")
         logger.info("🎵 AMÉLIORATION AUDIO ADAPTATIVE")
-        logger.info("=" * 60)
-        logger.info(f"📁 Fichier d'entrée: {args.input_file}")
+        logger.info("============================================================")
+        logger.info(f"📁 Fichier d'entrée: {args.input}")
         logger.info(f"📁 Fichier de sortie: {args.output}")
         
         # Chargement de l'audio
-        logger.info(f"📖 Chargement de l'audio...")
-        y, sr = librosa.load(args.input_file, sr=args.target_sr)
+        logger.info("📖 Chargement de l'audio...")
+        y, sr = librosa.load(args.input, sr=16000)
         
         logger.info(f"   • Durée: {len(y)/sr:.1f}s")
         logger.info(f"   • Fréquence: {sr} Hz")
         logger.info(f"   • Échantillons: {len(y):,}")
         
-        # Analyse des caractéristiques (pour sauvegarde optionnelle)
-        if args.save_analysis:
-            logger.info("🔍 Analyse des caractéristiques pour sauvegarde...")
+        # NOUVEAU: Calcul automatique de l'intensité selon la qualité
+        if args.intensity.lower() == "auto":
+            # Analyse préliminaire pour déterminer la qualité
             characteristics = analyze_audio_characteristics(y, sr, logger)
-            save_audio_analysis(characteristics, args.input_file, logger)
+            quality = characteristics['recording_quality']
+            
+            # Intensité adaptative selon la qualité
+            intensity_map = {
+                'high': 0.7,    # Traitement conservateur pour préserver la qualité
+                'medium': 1.0,  # Traitement standard
+                'low': 1.3      # Traitement plus agressif pour améliorer
+            }
+            intensity = intensity_map[quality]
+            
+            logger.info(f"🧠 Intensité automatique: {intensity:.1f} (qualité: {quality})")
+        else:
+            intensity = float(args.intensity)
+            logger.info(f"🎛️ Intensité manuelle: {intensity:.1f}")
+            # Analyse nécessaire pour la sauvegarde si demandée
+            characteristics = None
+        
+        # Sauvegarde de l'analyse si demandée
+        if args.save_analysis:
+            if characteristics is None:
+                characteristics = analyze_audio_characteristics(y, sr, logger)
+            save_audio_analysis(characteristics, args.input, logger)
         
         # Traitement adaptatif
-        y_enhanced = process_audio_adaptive(y, sr, logger)
+        y_enhanced = process_audio_adaptive(y, sr, intensity, logger)
         
         # Sauvegarde
         logger.info(f"💾 Sauvegarde du résultat...")

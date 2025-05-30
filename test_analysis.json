@@ -1,0 +1,26 @@
+{
+  "mean_energy": 0.00938042625784874,
+  "energy_std": 0.019180776551365852,
+  "dynamic_range": 0.10280171781778336,
+  "energy_percentiles": [
+    0.00010761371959233657,
+    0.00022351117513608187,
+    0.00044028370757587254,
+    0.0008657949510961771,
+    0.002287851879373193,
+    0.04390143230557442,
+    0.052884068340063095
+  ],
+  "spectral_center": 969.3016282184409,
+  "spectral_rolloff": 2009.3227652616279,
+  "spectral_bandwidth": 1426.771172672844,
+  "silence_threshold": 0.00022351117513608187,
+  "snr_estimate": 38.7665319442749,
+  "weak_voice_ratio": 0.2499431947284708,
+  "very_weak_ratio": 0.09997727789138833,
+  "recording_quality": "high",
+  "duration": 44.001875,
+  "sample_rate": 16000,
+  "analysis_timestamp": 1748622179.482811,
+  "source_file": "test.wav"
+}
