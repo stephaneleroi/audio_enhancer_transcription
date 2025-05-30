@@ -8,7 +8,7 @@ import time
 import re
 from difflib import SequenceMatcher
 import json
-from transcription import transcribe_audio_improved
+from transcription_0 import transcribe_audio_improved
 
 def split_into_sentences(text: str) -> List[str]:
     """
