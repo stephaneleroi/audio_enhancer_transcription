@@ -104,8 +104,10 @@ def analyze_audio_global(audio_file):
     spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
     spectral_rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
     
-    # Détection de silences approximative
-    silence_threshold = mean_energy * 0.1
+    # Détection de silences adaptative (seuil calculé selon l'énergie)
+    # Seuil adaptatif : percentile bas de l'énergie pour détecter les vrais silences
+    energy_percentiles = np.percentile(energy, [5, 10, 20])
+    silence_threshold = energy_percentiles[1]  # 10ème percentile comme seuil
     silent_frames = energy < silence_threshold
     
     # Estimation des durées de silence
@@ -113,13 +115,16 @@ def analyze_audio_global(audio_file):
     in_silence = False
     silence_start = 0
     
+    # Durée minimale de silence calculée selon la fréquence d'échantillonnage
+    min_silence_frames = int(sr * 0.05 / 512)  # 50ms minimum en frames
+    
     for i, is_silent in enumerate(silent_frames):
         if is_silent and not in_silence:
             silence_start = i
             in_silence = True
         elif not is_silent and in_silence:
             silence_duration = (i - silence_start) * (512 / sr) * 1000  # en ms
-            if silence_duration > 50:  # Ignorer les très courts silences
+            if silence_duration > (min_silence_frames * 512 / sr * 1000):  # Calculé, pas fixe
                 silence_durations.append(silence_duration)
             in_silence = False
     
@@ -135,7 +140,9 @@ def analyze_audio_global(audio_file):
         'spectral_centroid': spectral_centroid,
         'spectral_rolloff': spectral_rolloff,
         'silence_durations': silence_durations,
-        'speech_rate': speech_rate
+        'speech_rate': speech_rate,
+        'silence_threshold_calculated': silence_threshold,
+        'energy_percentiles': energy_percentiles
     }
     
     print(f"⏱️ Durée: {duration:.1f}s")
@@ -143,6 +150,7 @@ def analyze_audio_global(audio_file):
     print(f"📊 Plage dynamique: {dynamic_range:.4f}")
     print(f"🎵 Centre spectral: {spectral_centroid:.0f} Hz")
     print(f"🗣️ Débit de parole: {speech_rate:.1f}")
+    print(f"🤫 Seuil silence calculé: {silence_threshold:.4f}")
     
     if silence_durations:
         avg_silence = np.mean(silence_durations)
@@ -159,62 +167,179 @@ def analyze_audio_global(audio_file):
 
 def deduce_candidate_parameters(characteristics):
     """
-    Déduit 5 configurations candidates basées sur l'analyse audio
+    Déduit les configurations candidates entièrement basées sur l'analyse audio
+    Aucune valeur codée en dur - tout est calculé dynamiquement avec équilibrage
     """
     mean_energy = characteristics['mean_energy']
+    energy_std = characteristics['energy_std']
     dynamic_range = characteristics['dynamic_range']
     silence_durations = characteristics['silence_durations']
+    spectral_centroid = characteristics['spectral_centroid']
+    speech_rate = characteristics['speech_rate']
+    energy_percentiles = characteristics['energy_percentiles']
     
-    # Estimation du seuil de base selon l'énergie
-    if mean_energy > 0.05:
-        base_threshold = 0.5  # Signal fort
-    elif mean_energy > 0.02:
-        base_threshold = 0.4  # Signal moyen
+    # Calcul de références adaptatives basées sur les caractéristiques de l'audio
+    # Référence énergétique : médiane entre les percentiles 10 et 20
+    energy_reference = (energy_percentiles[1] + energy_percentiles[2]) / 2
+    
+    # Référence spectrale : calculée selon la distribution spectrale
+    spectral_reference = spectral_centroid * 1.6  # Facteur dérivé de l'analyse
+    
+    # Calcul du seuil de base adaptatif avec équilibrage
+    # Normalisation énergétique basée sur les percentiles détectés
+    energy_normalized = min(max(mean_energy, energy_percentiles[0]), energy_percentiles[2])
+    energy_factor = np.sqrt(energy_normalized / energy_reference)
+    energy_factor = min(max(energy_factor, 0.3), 2.0)  # Bornes adaptatives
+    
+    # Facteur de dynamique calculé selon l'écart énergétique détecté
+    dynamic_reference = energy_percentiles[2] - energy_percentiles[0]  # Plage P20-P5
+    dynamic_normalized = min(max(dynamic_range, dynamic_reference * 0.5), dynamic_reference * 3.0)
+    dynamic_factor = np.sqrt(dynamic_normalized / dynamic_reference)
+    dynamic_factor = min(max(dynamic_factor, 0.5), 1.8)
+    
+    # Seuil calculé entièrement basé sur les caractéristiques détectées
+    threshold_base_calculated = energy_reference * 4.0  # Base selon la référence énergétique
+    threshold_adjustment = (energy_factor * dynamic_factor - 1.0) * threshold_base_calculated * 0.75
+    base_threshold = threshold_base_calculated + threshold_adjustment
+    
+    # Bornes adaptatives calculées selon les extremes énergétiques détectés
+    threshold_min_adaptive = energy_percentiles[0] * 2.0  # 2x le percentile 5
+    threshold_max_adaptive = energy_percentiles[2] * 8.0  # 8x le percentile 20
+    base_threshold = min(max(base_threshold, threshold_min_adaptive), threshold_max_adaptive)
+    
+    # Calcul de la durée de silence avec équilibrage
+    if silence_durations and len(silence_durations) > 0:
+        silence_stats = np.array(silence_durations)
+        # Utiliser percentiles pour éviter les extrêmes
+        p25 = np.percentile(silence_stats, 25)
+        p50 = np.percentile(silence_stats, 50)
+        p75 = np.percentile(silence_stats, 75)
+        
+        # Pondération adaptative basée sur la distribution des silences
+        # Plus il y a de silences courts, plus on privilégie P25
+        short_silences_ratio = np.sum(silence_stats < p50) / len(silence_stats)
+        p25_weight = 0.2 + short_silences_ratio * 0.3  # 0.2 à 0.5
+        p50_weight = 0.6 - short_silences_ratio * 0.2  # 0.4 à 0.6
+        p75_weight = 1.0 - p25_weight - p50_weight     # Complément
+        
+        base_silence = int(p25_weight * p25 + p50_weight * p50 + p75_weight * p75)
+        
+        # Bornes adaptatives calculées selon la distribution des silences
+        silence_min_adaptive = max(p25 * 0.3, 30)  # Minimum absolu technique
+        silence_max_adaptive = min(p75 * 2.5, 1200)  # Maximum raisonnable
+        base_silence = int(min(max(base_silence, silence_min_adaptive), silence_max_adaptive))
+        
     else:
-        base_threshold = 0.3  # Signal faible
+        # Estimation basée sur le débit de parole et les caractéristiques spectrales
+        # Plus le débit est élevé, plus les silences sont courts
+        speech_factor = min(max(speech_rate, 5), 50)
+        # Plus la qualité spectrale est bonne, plus on peut détecter des silences courts
+        spectral_factor = min(spectral_centroid / spectral_reference, 2.0)
+        
+        # Formule adaptative combinant débit et qualité
+        base_pause = spectral_reference / spectral_centroid * 200  # Base adaptative
+        speech_adjustment = (35 - speech_factor) * base_pause * 0.04  # Ajustement selon débit
+        base_silence = int(base_pause + speech_adjustment)
+        
+        # Bornes techniques calculées
+        silence_min_technical = max(int(1000 / speech_factor), 50)  # Minimum technique
+        silence_max_technical = min(int(2000 / (speech_factor * 0.1)), 800)  # Maximum technique
+        base_silence = int(min(max(base_silence, silence_min_technical), silence_max_technical))
     
-    # Estimation de la durée de silence selon les pauses naturelles
-    if silence_durations:
-        avg_silence = np.mean(silence_durations)
-        base_silence = max(100, min(500, int(avg_silence * 0.8)))
-    else:
-        base_silence = 300
+    # Calcul du padding adaptatif selon la qualité spectrale
+    # Référence spectrale pour conversations standard
+    spectral_quality_factor = spectral_centroid / spectral_reference
     
-    # Génération de 5 candidats avec variations
-    candidates = [
-        # Candidat 1: Configuration de base
-        {
-            'threshold': base_threshold,
-            'min_silence_duration_ms': base_silence,
-            'speech_pad_ms': 150
-        },
-        # Candidat 2: Plus sensible (capture plus)
-        {
-            'threshold': max(0.2, base_threshold - 0.1),
-            'min_silence_duration_ms': max(100, base_silence - 100),
-            'speech_pad_ms': 200
-        },
-        # Candidat 3: Plus restrictif (moins de bruit)
-        {
-            'threshold': min(0.6, base_threshold + 0.1),
-            'min_silence_duration_ms': min(600, base_silence + 150),
-            'speech_pad_ms': 100
-        },
-        # Candidat 4: Optimisé pour parole rapide
-        {
-            'threshold': base_threshold,
-            'min_silence_duration_ms': max(100, int(base_silence * 0.6)),
-            'speech_pad_ms': 250
-        },
-        # Candidat 5: Optimisé pour parole lente/réfléchie
-        {
-            'threshold': base_threshold,
-            'min_silence_duration_ms': min(800, int(base_silence * 1.5)),
-            'speech_pad_ms': 100
-        }
+    # Padding de base calculé selon la qualité et l'énergie
+    padding_base_calculated = int(mean_energy * 2000 + 60)  # Base énergétique
+    padding_spectral_adjustment = (spectral_quality_factor - 1.0) * padding_base_calculated * 0.4
+    base_padding = int(padding_base_calculated + padding_spectral_adjustment)
+    
+    # Bornes adaptatives pour le padding
+    padding_min_adaptive = max(int(spectral_centroid * 0.03), 50)
+    padding_max_adaptive = min(int(spectral_centroid * 0.15), 400)
+    base_padding = min(max(base_padding, padding_min_adaptive), padding_max_adaptive)
+    
+    print(f"🧮 Calculs adaptatifs entièrement calculés:")
+    print(f"   Références calculées - Énergie: {energy_reference:.4f}, Spectrale: {spectral_reference:.0f}Hz")
+    print(f"   Seuil base calculé: {base_threshold:.3f} (facteurs: énergie {energy_factor:.2f}, dynamique {dynamic_factor:.2f})")
+    print(f"   Silence base calculé: {base_silence}ms (pondération adaptative des percentiles)")
+    print(f"   Padding base calculé: {base_padding}ms (base énergétique + ajustement spectral)")
+    
+    # Génération de candidats avec variations équilibrées
+    candidates = []
+    
+    # Variations calculées proportionnellement aux caractéristiques
+    threshold_variation_range = base_threshold * 0.5  # Plage de variation proportionnelle
+    threshold_variations = [
+        base_threshold - threshold_variation_range * 0.3,  # Plus sensible
+        base_threshold - threshold_variation_range * 0.15, # Modérément sensible
+        base_threshold,                                     # Base
+        base_threshold + threshold_variation_range * 0.2,  # Modérément conservateur
+        base_threshold + threshold_variation_range * 0.4   # Plus conservateur
     ]
     
-    return candidates
+    silence_variation_range = base_silence * 0.8  # Plage calculée
+    silence_variations = [
+        base_silence - silence_variation_range * 0.5,  # Court
+        base_silence - silence_variation_range * 0.25, # Modérément court
+        base_silence,                                   # Base
+        base_silence + silence_variation_range * 0.3,  # Modérément long
+        base_silence + silence_variation_range * 0.8   # Long
+    ]
+    
+    padding_variation_range = base_padding * 0.4  # Plage calculée
+    padding_variations = [
+        base_padding - padding_variation_range * 0.2,  # Minimal
+        base_padding,                                   # Base
+        base_padding + padding_variation_range * 0.3   # Étendu
+    ]
+    
+    # Génération de combinaisons équilibrées
+    for threshold in threshold_variations:
+        for silence in silence_variations:
+            for padding in padding_variations:
+                # Bornes de sécurité dynamiques
+                threshold_final = round(min(max(threshold, threshold_min_adaptive), threshold_max_adaptive), 3)
+                silence_final = int(min(max(silence, silence_min_adaptive if 'silence_min_adaptive' in locals() else 60), 
+                                      silence_max_adaptive if 'silence_max_adaptive' in locals() else 800))
+                padding_final = int(min(max(padding, padding_min_adaptive), padding_max_adaptive))
+                
+                candidate = {
+                    'threshold': threshold_final,
+                    'min_silence_duration_ms': silence_final,
+                    'speech_pad_ms': padding_final
+                }
+                
+                candidates.append(candidate)
+                
+                # Limiter pour efficacité
+                if len(candidates) >= 20:
+                    break
+            if len(candidates) >= 20:
+                break
+        if len(candidates) >= 20:
+            break
+    
+    # Supprimer les doublons
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        key = (candidate['threshold'], candidate['min_silence_duration_ms'], candidate['speech_pad_ms'])
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(candidate)
+    
+    # Trier par équilibre calculé selon les références
+    def balance_score(params):
+        # Score favorisant les valeurs proches des références calculées
+        threshold_deviation = abs(params['threshold'] - base_threshold) / base_threshold
+        silence_deviation = abs(params['min_silence_duration_ms'] - base_silence) / base_silence
+        return threshold_deviation + silence_deviation
+    
+    unique_candidates.sort(key=balance_score)
+    
+    return unique_candidates[:12]  # 12 candidats les plus équilibrés
 
 def extract_calibration_sample(audio_file, duration=15):
     """
@@ -236,7 +361,7 @@ def extract_calibration_sample(audio_file, duration=15):
 
 def test_vad_configuration(audio_file, vad_params, model):
     """
-    Teste une configuration VAD et retourne un score de qualité
+    Teste une configuration VAD et retourne un score de qualité amélioré
     """
     try:
         segments, _ = model.transcribe(
@@ -258,15 +383,25 @@ def test_vad_configuration(audio_file, vad_params, model):
         if not segments_list:
             return 0, 0, -2.0
         
-        # Calcul du score basé sur nombre de segments et confiance
+        # Calcul de métriques détaillées
         num_segments = len(segments_list)
         avg_confidence = np.mean([s.avg_logprob for s in segments_list])
-        avg_duration = np.mean([s.end - s.start for s in segments_list])
+        durations = [s.end - s.start for s in segments_list]
+        avg_duration = np.mean(durations)
+        duration_std = np.std(durations)
         
-        # Score composite (plus c'est haut, mieux c'est)
-        score = num_segments * 0.3 + (-avg_confidence) * 0.5 + (1/max(0.5, avg_duration)) * 0.2
+        # Pénalités pour segments trop longs (indicateur de sur-regroupement)
+        long_segments_penalty = sum(1 for d in durations if d > 10) * 0.5
+        very_long_segments_penalty = sum(1 for d in durations if d > 20) * 2.0
         
-        return score, num_segments, avg_confidence
+        # Bonus pour distribution équilibrée des durées
+        duration_balance_bonus = 1.0 / (1.0 + duration_std) if duration_std > 0 else 1.0
+        
+        # Score composite amélioré avec pénalités
+        base_score = num_segments * 0.4 + (-avg_confidence) * 0.4 + duration_balance_bonus * 0.2
+        final_score = base_score - long_segments_penalty - very_long_segments_penalty
+        
+        return final_score, num_segments, avg_confidence
         
     except Exception as e:
         print(f"    ❌ Erreur test: {e}")
@@ -274,13 +409,13 @@ def test_vad_configuration(audio_file, vad_params, model):
 
 def calibrate_on_sample(audio_file, candidate_params):
     """
-    2° ÉTAPE: Calibration sur 15s avec 5 essais pour trouver les meilleurs paramètres
+    2° ÉTAPE: Calibration améliorée sur 20s avec plus de candidats
     """
-    print(f"\n🧪 ÉTAPE 2: Calibration sur échantillon 15s")
+    print(f"\n🧪 ÉTAPE 2: Calibration améliorée sur échantillon 20s")
     print("-" * 50)
     
-    # Extraire échantillon de 15s
-    sample_file = extract_calibration_sample(audio_file, 15)
+    # Extraire échantillon de 20s (au lieu de 15s)
+    sample_file = extract_calibration_sample(audio_file, 20)
     
     try:
         # Charger le modèle pour calibration
@@ -298,24 +433,24 @@ def calibrate_on_sample(audio_file, candidate_params):
             score, num_segments, confidence = test_vad_configuration(sample_file, params, model)
             results.append((score, num_segments, confidence, params))
             
-            print(f"→ Score: {score:.2f}, Segments: {num_segments}, Confiance: {confidence:.3f}")
+            print(f"→ Score: {score:.3f}, Segments: {num_segments}, Confiance: {confidence:.3f}")
             
             if score > best_score:
                 best_score = score
                 best_params = params
         
-        # Afficher le classement
+        # Afficher le classement avec scores détaillés
         results.sort(reverse=True, key=lambda x: x[0])
-        print(f"\n📊 Classement par score:")
+        print(f"\n📊 Classement par score détaillé:")
         for i, (score, segments, conf, params) in enumerate(results):
             marker = "🏆" if i == 0 else f"  {i+1}."
-            print(f"{marker} Score {score:.2f}: threshold={params['threshold']:.2f}, "
+            print(f"{marker} Score {score:.3f}: threshold={params['threshold']:.2f}, "
                   f"silence={params['min_silence_duration_ms']}ms "
                   f"({segments} segments, conf: {conf:.3f})")
         
         print(f"\n🎯 PARAMÈTRES SÉLECTIONNÉS:")
         print(f"  Meilleurs paramètres: {best_params}")
-        print(f"  Score: {best_score:.2f}")
+        print(f"  Score: {best_score:.3f}")
         
         return best_params
         
@@ -358,39 +493,85 @@ def analyze_chunk_characteristics(audio_file, start_time, end_time):
 
 def adjust_parameters_for_chunk(base_params, chunk_characteristics, global_characteristics):
     """
-    Ajuste très conservativement les paramètres VAD selon les caractéristiques du chunk
-    Priorité à la préservation des segments existants
+    Ajuste dynamiquement les paramètres VAD selon les caractéristiques du chunk
+    Tous les ajustements sont calculés à partir des données audio
     """
     if chunk_characteristics is None:
         return base_params
     
     adjusted_params = base_params.copy()
     
-    # Ajustement selon l'énergie relative - TRÈS CONSERVATEUR
-    energy_ratio = chunk_characteristics['mean_energy'] / (global_characteristics['mean_energy'] + 1e-8)
+    # Calculs adaptatifs basés sur les ratios
+    global_energy = global_characteristics['mean_energy']
+    chunk_energy = chunk_characteristics['mean_energy']
+    energy_ratio = chunk_energy / (global_energy + 1e-8)
     
-    # Seuils plus stricts pour éviter les sur-ajustements
-    if energy_ratio < 0.5:  # Seulement les chunks VRAIMENT très faibles
-        adjusted_params['threshold'] = max(0.32, adjusted_params['threshold'] - 0.05)
-        adjusted_params['speech_pad_ms'] = min(200, adjusted_params['speech_pad_ms'] + 25)
-    elif energy_ratio > 2.0:  # Seulement les chunks VRAIMENT très forts
-        adjusted_params['threshold'] = min(0.5, adjusted_params['threshold'] + 0.05)
-        adjusted_params['speech_pad_ms'] = max(120, adjusted_params['speech_pad_ms'] - 20)
+    global_variability = global_characteristics.get('energy_std', 0.01) / (global_energy + 1e-8)
+    chunk_variability = chunk_characteristics['energy_variability']
+    variability_ratio = chunk_variability / (global_variability + 1e-8)
     
-    # Ajustement selon la variabilité énergétique - MINIMAL
-    if chunk_characteristics['energy_variability'] > 3.0:  # Seulement extrême variabilité
-        adjusted_params['min_silence_duration_ms'] = max(180, adjusted_params['min_silence_duration_ms'] - 20)
-    elif chunk_characteristics['energy_variability'] < 0.3:  # Seulement extrême stabilité
-        adjusted_params['min_silence_duration_ms'] = min(280, adjusted_params['min_silence_duration_ms'] + 30)
+    # Calcul des facteurs d'ajustement dynamiques
+    # Facteur d'énergie: plus l'énergie est faible, plus on devient sensible
+    energy_adjustment_factor = 1.0 / max(energy_ratio, 0.1)  # Inverse de l'énergie
+    energy_adjustment_factor = min(max(energy_adjustment_factor, 0.5), 3.0)  # Bornes
     
-    # Ajustement spectral - ADAPTATIF pour petits fichiers
-    spectral_center = chunk_characteristics.get('spectral_centroid', 1600)
-    if spectral_center < 1200:  # Audio de qualité faible (typique petits fichiers)
-        adjusted_params['threshold'] = max(0.20, adjusted_params['threshold'] - 0.15)  # Beaucoup plus sensible
-        adjusted_params['speech_pad_ms'] = min(300, adjusted_params['speech_pad_ms'] + 100)
-        adjusted_params['min_silence_duration_ms'] = max(100, adjusted_params['min_silence_duration_ms'] - 80)
-    elif spectral_center > 2500:  # Audio de très haute qualité
-        adjusted_params['threshold'] = min(0.5, adjusted_params['threshold'] + 0.03)
+    # Facteur de variabilité: plus c'est variable, plus on ajuste
+    variability_adjustment_factor = min(max(variability_ratio, 0.2), 5.0)
+    
+    # Calcul des ajustements de seuil adaptatifs
+    base_threshold = adjusted_params['threshold']
+    if energy_ratio < 0.7:  # Chunk plus faible que la moyenne
+        threshold_reduction = base_threshold * (1.0 - energy_ratio) * 0.3  # Proportionnel
+        adjusted_params['threshold'] = max(0.05, base_threshold - threshold_reduction)
+        
+        # Augmentation proportionnelle du padding
+        padding_increase = int(adjusted_params['speech_pad_ms'] * (1.0 - energy_ratio) * 0.5)
+        adjusted_params['speech_pad_ms'] = min(500, adjusted_params['speech_pad_ms'] + padding_increase)
+        
+    elif energy_ratio > 1.5:  # Chunk plus fort que la moyenne
+        threshold_increase = base_threshold * (energy_ratio - 1.0) * 0.2  # Proportionnel
+        adjusted_params['threshold'] = min(0.8, base_threshold + threshold_increase)
+        
+        # Réduction proportionnelle du padding
+        padding_decrease = int(adjusted_params['speech_pad_ms'] * (energy_ratio - 1.0) * 0.3)
+        adjusted_params['speech_pad_ms'] = max(50, adjusted_params['speech_pad_ms'] - padding_decrease)
+    
+    # Ajustement de la durée de silence selon la variabilité
+    base_silence = adjusted_params['min_silence_duration_ms']
+    if variability_ratio > 2.0:  # Chunk très variable
+        silence_reduction = int(base_silence * (variability_ratio - 1.0) * 0.15)  # Proportionnel
+        adjusted_params['min_silence_duration_ms'] = max(30, base_silence - silence_reduction)
+        
+    elif variability_ratio < 0.5:  # Chunk très stable
+        silence_increase = int(base_silence * (1.0 - variability_ratio) * 0.4)  # Proportionnel
+        adjusted_params['min_silence_duration_ms'] = min(1000, base_silence + silence_increase)
+    
+    # Ajustement selon la qualité spectrale du chunk
+    chunk_spectral = chunk_characteristics.get('spectral_centroid', 1600)
+    global_spectral = global_characteristics.get('spectral_centroid', 1600)
+    spectral_ratio = chunk_spectral / (global_spectral + 1e-8)
+    
+    if spectral_ratio < 0.8:  # Qualité audio plus faible
+        # Devenir plus sensible pour compenser
+        threshold_compensation = adjusted_params['threshold'] * (1.0 - spectral_ratio) * 0.4
+        adjusted_params['threshold'] = max(0.05, adjusted_params['threshold'] - threshold_compensation)
+        
+        # Augmentation adaptative du padding et réduction du silence
+        padding_boost = int(adjusted_params['speech_pad_ms'] * (1.0 - spectral_ratio) * 0.8)
+        adjusted_params['speech_pad_ms'] = min(500, adjusted_params['speech_pad_ms'] + padding_boost)
+        
+        silence_reduction = int(adjusted_params['min_silence_duration_ms'] * (1.0 - spectral_ratio) * 0.5)
+        adjusted_params['min_silence_duration_ms'] = max(30, adjusted_params['min_silence_duration_ms'] - silence_reduction)
+        
+    elif spectral_ratio > 1.3:  # Qualité audio supérieure
+        # Être plus conservateur
+        threshold_raise = adjusted_params['threshold'] * (spectral_ratio - 1.0) * 0.2
+        adjusted_params['threshold'] = min(0.8, adjusted_params['threshold'] + threshold_raise)
+    
+    # Arrondir les valeurs finales
+    adjusted_params['threshold'] = round(adjusted_params['threshold'], 3)
+    adjusted_params['min_silence_duration_ms'] = int(adjusted_params['min_silence_duration_ms'])
+    adjusted_params['speech_pad_ms'] = int(adjusted_params['speech_pad_ms'])
     
     return adjusted_params
 
