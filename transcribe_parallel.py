@@ -22,11 +22,8 @@ from typing import List, Dict, Any, Optional, Tuple
 import pickle
 
 # Prompt initial pour améliorer la qualité de transcription
-INITIAL_PROMPT = """
-Transcription d'une réunion professionnelle avec plusieurs intervenants.
-Certains participants parlent à voix basse ou sont éloignés du microphone.
-Le vocabulaire utilisé est formel et technique.
-"""
+# DÉSACTIVÉ: Cause des hallucinations avec le mot "réunion"
+INITIAL_PROMPT = ""
 
 @dataclass
 class ChunkTask:
@@ -275,45 +272,23 @@ def test_vad_configuration(audio_file, vad_params, model):
 def calibrate_on_sample(audio_file, candidate_params):
     """
     2° ÉTAPE: Calibration sur 15s avec 5 essais pour trouver les meilleurs paramètres
+    OVERRIDE: Utilise les paramètres optimaux connus du script final
     """
     print(f"\n🧪 ÉTAPE 2: Calibration sur échantillon 15s")
     print("-" * 50)
     
-    # Extraire l'échantillon
-    sample_file = extract_calibration_sample(audio_file, 15)
+    # Utiliser directement les paramètres optimaux connus
+    best_params = {
+        'threshold': 0.4,
+        'min_silence_duration_ms': 212,
+        'speech_pad_ms': 150
+    }
     
-    try:
-        # Charger le modèle Whisper pour calibration
-        model = WhisperModel('large-v3', device='cpu', compute_type='int8')
-        
-        best_score = -1
-        best_params = None
-        best_stats = None
-        
-        print("🔬 Test des 5 configurations candidates:")
-        
-        for i, params in enumerate(candidate_params):
-            print(f"  Test {i+1}: threshold={params['threshold']}, silence={params['min_silence_duration_ms']}ms")
-            
-            score, num_segments, confidence = test_vad_configuration(sample_file, params, model)
-            
-            print(f"    📊 Score: {score:.3f}, Segments: {num_segments}, Confiance: {confidence:.3f}")
-            
-            if score > best_score:
-                best_score = score
-                best_params = params.copy()
-                best_stats = (score, num_segments, confidence)
-        
-        print(f"\n🏆 MEILLEURE CONFIGURATION:")
-        print(f"  Paramètres: {best_params}")
-        print(f"  Score: {best_stats[0]:.3f}, Segments: {best_stats[1]}, Confiance: {best_stats[2]:.3f}")
-        
-        return best_params
-        
-    finally:
-        # Nettoyage
-        if os.path.exists(sample_file):
-            os.remove(sample_file)
+    print(f"🎯 UTILISATION DES PARAMÈTRES OPTIMAUX CONNUS:")
+    print(f"  Paramètres: {best_params}")
+    print(f"  (Basés sur l'optimisation précédente du script final)")
+    
+    return best_params
 
 def analyze_chunk_characteristics(audio_file, start_time, end_time):
     """
@@ -472,7 +447,7 @@ def parallel_transcription_main():
     # ÉTAPE 1: Analyse globale
     global_characteristics, candidate_params = analyze_audio_global(audio_file)
     
-    # ÉTAPE 2: Calibration sur échantillon
+    # ÉTAPE 2: Calibration sur échantillon (utilise les paramètres optimaux)
     best_params = calibrate_on_sample(audio_file, candidate_params)
     
     # ÉTAPE 3: Préparation des chunks avec analyse
@@ -480,7 +455,7 @@ def parallel_transcription_main():
     print("-" * 60)
     
     total_duration = global_characteristics['duration']
-    chunk_size = 25  # secondes
+    chunk_size = 30  # Augmenté de 25s à 30s pour plus de contexte
     num_chunks = int(np.ceil(total_duration / chunk_size))
     optimal_workers = get_optimal_worker_count()
     
@@ -502,13 +477,10 @@ def parallel_transcription_main():
         # Analyser les caractéristiques du chunk
         chunk_characteristics = analyze_chunk_characteristics(audio_file, start_chunk, end_chunk)
         
-        # Ajuster les paramètres pour ce chunk
-        adjusted_params = adjust_parameters_for_chunk(best_params, chunk_characteristics, global_characteristics)
+        # Utiliser les paramètres optimaux sans ajustement pour éviter la dégradation
+        adjusted_params = best_params.copy()
         
-        if adjusted_params != best_params:
-            print(f"🔧 Ajusté")
-        else:
-            print(f"✅ Standard")
+        print(f"✅ Paramètres optimaux")
         
         # Créer la tâche
         task = ChunkTask(
