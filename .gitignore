@@ -1,2 +1,80 @@
-gros.mp3
-gros_enhanced.wav 
+# Fichiers audio (tous formats)
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.wma
+
+# Fichiers de transcription et sous-titres
+*.txt
+*.srt
+*.vtt
+*.ass
+*.ssa
+
+# Fichiers temporaires et de cache
+temp_*
+*.tmp
+*.swp
+*.swo
+*~
+
+# Environnement et configuration
+.env
+.env.local
+.env.*.local
+
+# Dossiers de résultats
+converted_files/
+resampled_files/
+evaluation_results/
+output/
+results/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+logs/
+
+# Modèles pré-entraînés (si volumineux)
+models/
+*.model
+*.bin
+*.safetensors 
