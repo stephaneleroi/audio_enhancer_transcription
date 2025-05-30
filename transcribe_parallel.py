@@ -3,6 +3,8 @@
 Script de transcription adaptative multi-threadée
 Optimisé pour MacBook M3 avec 16 cœurs et 128GB RAM
 Système intelligent qui s'ajuste chunk par chunk avec traitement parallèle
+
+Usage: python transcribe_parallel.py [fichier_audio.wav]
 """
 
 import sys
@@ -20,6 +22,7 @@ import psutil
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 import pickle
+import argparse
 
 # Prompt initial pour améliorer la qualité de transcription
 # DÉSACTIVÉ: Cause des hallucinations avec le mot "réunion"
@@ -272,23 +275,54 @@ def test_vad_configuration(audio_file, vad_params, model):
 def calibrate_on_sample(audio_file, candidate_params):
     """
     2° ÉTAPE: Calibration sur 15s avec 5 essais pour trouver les meilleurs paramètres
-    OVERRIDE: Utilise les paramètres optimaux connus du script final
     """
     print(f"\n🧪 ÉTAPE 2: Calibration sur échantillon 15s")
     print("-" * 50)
     
-    # Utiliser directement les paramètres optimaux connus
-    best_params = {
-        'threshold': 0.4,
-        'min_silence_duration_ms': 212,
-        'speech_pad_ms': 150
-    }
+    # Extraire échantillon de 15s
+    sample_file = extract_calibration_sample(audio_file, 15)
     
-    print(f"🎯 UTILISATION DES PARAMÈTRES OPTIMAUX CONNUS:")
-    print(f"  Paramètres: {best_params}")
-    print(f"  (Basés sur l'optimisation précédente du script final)")
-    
-    return best_params
+    try:
+        # Charger le modèle pour calibration
+        model = WhisperModel('large-v3', device='cpu', compute_type='int8')
+        
+        best_score = 0
+        best_params = None
+        results = []
+        
+        print(f"🔬 Test de {len(candidate_params)} configurations candidates:")
+        
+        for i, params in enumerate(candidate_params):
+            print(f"  Candidat {i+1}: threshold={params['threshold']:.2f}, silence={params['min_silence_duration_ms']}ms", end=" ")
+            
+            score, num_segments, confidence = test_vad_configuration(sample_file, params, model)
+            results.append((score, num_segments, confidence, params))
+            
+            print(f"→ Score: {score:.2f}, Segments: {num_segments}, Confiance: {confidence:.3f}")
+            
+            if score > best_score:
+                best_score = score
+                best_params = params
+        
+        # Afficher le classement
+        results.sort(reverse=True, key=lambda x: x[0])
+        print(f"\n📊 Classement par score:")
+        for i, (score, segments, conf, params) in enumerate(results):
+            marker = "🏆" if i == 0 else f"  {i+1}."
+            print(f"{marker} Score {score:.2f}: threshold={params['threshold']:.2f}, "
+                  f"silence={params['min_silence_duration_ms']}ms "
+                  f"({segments} segments, conf: {conf:.3f})")
+        
+        print(f"\n🎯 PARAMÈTRES SÉLECTIONNÉS:")
+        print(f"  Meilleurs paramètres: {best_params}")
+        print(f"  Score: {best_score:.2f}")
+        
+        return best_params
+        
+    finally:
+        # Nettoyage
+        if os.path.exists(sample_file):
+            os.remove(sample_file)
 
 def analyze_chunk_characteristics(audio_file, start_time, end_time):
     """
@@ -324,35 +358,45 @@ def analyze_chunk_characteristics(audio_file, start_time, end_time):
 
 def adjust_parameters_for_chunk(base_params, chunk_characteristics, global_characteristics):
     """
-    Ajuste les paramètres VAD selon les caractéristiques du chunk
+    Ajuste très conservativement les paramètres VAD selon les caractéristiques du chunk
+    Priorité à la préservation des segments existants
     """
     if chunk_characteristics is None:
         return base_params
     
     adjusted_params = base_params.copy()
     
-    # Ajustement selon l'énergie relative
+    # Ajustement selon l'énergie relative - TRÈS CONSERVATEUR
     energy_ratio = chunk_characteristics['mean_energy'] / (global_characteristics['mean_energy'] + 1e-8)
     
-    if energy_ratio < 0.7:  # Chunk plus faible que la moyenne
-        adjusted_params['threshold'] = max(0.2, adjusted_params['threshold'] - 0.1)
-        adjusted_params['speech_pad_ms'] = min(300, adjusted_params['speech_pad_ms'] + 50)
-    elif energy_ratio > 1.3:  # Chunk plus fort que la moyenne
-        adjusted_params['threshold'] = min(0.6, adjusted_params['threshold'] + 0.1)
-        adjusted_params['speech_pad_ms'] = max(100, adjusted_params['speech_pad_ms'] - 50)
+    # Seuils plus stricts pour éviter les sur-ajustements
+    if energy_ratio < 0.5:  # Seulement les chunks VRAIMENT très faibles
+        adjusted_params['threshold'] = max(0.32, adjusted_params['threshold'] - 0.05)
+        adjusted_params['speech_pad_ms'] = min(200, adjusted_params['speech_pad_ms'] + 25)
+    elif energy_ratio > 2.0:  # Seulement les chunks VRAIMENT très forts
+        adjusted_params['threshold'] = min(0.5, adjusted_params['threshold'] + 0.05)
+        adjusted_params['speech_pad_ms'] = max(120, adjusted_params['speech_pad_ms'] - 20)
     
-    # Ajustement selon la variabilité
-    if chunk_characteristics['energy_variability'] > 2.0:  # Très variable
-        adjusted_params['min_silence_duration_ms'] = max(100, adjusted_params['min_silence_duration_ms'] - 50)
-    elif chunk_characteristics['energy_variability'] < 0.5:  # Très stable
-        adjusted_params['min_silence_duration_ms'] = min(600, adjusted_params['min_silence_duration_ms'] + 100)
+    # Ajustement selon la variabilité énergétique - MINIMAL
+    if chunk_characteristics['energy_variability'] > 3.0:  # Seulement extrême variabilité
+        adjusted_params['min_silence_duration_ms'] = max(180, adjusted_params['min_silence_duration_ms'] - 20)
+    elif chunk_characteristics['energy_variability'] < 0.3:  # Seulement extrême stabilité
+        adjusted_params['min_silence_duration_ms'] = min(280, adjusted_params['min_silence_duration_ms'] + 30)
+    
+    # Ajustement spectral - ADAPTATIF pour petits fichiers
+    spectral_center = chunk_characteristics.get('spectral_centroid', 1600)
+    if spectral_center < 1200:  # Audio de qualité faible (typique petits fichiers)
+        adjusted_params['threshold'] = max(0.20, adjusted_params['threshold'] - 0.15)  # Beaucoup plus sensible
+        adjusted_params['speech_pad_ms'] = min(300, adjusted_params['speech_pad_ms'] + 100)
+        adjusted_params['min_silence_duration_ms'] = max(100, adjusted_params['min_silence_duration_ms'] - 80)
+    elif spectral_center > 2500:  # Audio de très haute qualité
+        adjusted_params['threshold'] = min(0.5, adjusted_params['threshold'] + 0.03)
     
     return adjusted_params
 
 def transcribe_chunk_worker(task_data):
     """
-    Worker function pour transcription parallèle d'un chunk
-    Chaque worker a son propre modèle Whisper
+    Worker function pour transcription parallèle d'un chunk avec adaptation
     """
     try:
         # Désérialiser la tâche
@@ -377,7 +421,7 @@ def transcribe_chunk_worker(task_data):
         
         subprocess.run(cmd, capture_output=True, check=True)
         
-        # Transcription
+        # Transcription avec paramètres adaptés
         segments, _ = model.transcribe(
             chunk_file,
             language='fr',
@@ -404,6 +448,9 @@ def transcribe_chunk_worker(task_data):
         
         processing_time = time.time() - start_time
         
+        # Informations sur l'adaptation utilisée
+        adaptation_info = f"threshold={task.vad_params['threshold']:.2f}, silence={task.vad_params['min_silence_duration_ms']}ms"
+        
         # Nettoyage
         if os.path.exists(chunk_file):
             os.remove(chunk_file)
@@ -414,7 +461,8 @@ def transcribe_chunk_worker(task_data):
             confidence=confidence,
             processing_time=processing_time,
             worker_id=worker_id,
-            success=True
+            success=True,
+            error=adaptation_info
         )
         
     except Exception as e:
@@ -432,16 +480,18 @@ def transcribe_chunk_worker(task_data):
             error=str(e)
         )
 
-def parallel_transcription_main():
+def parallel_transcription_main(audio_file=None):
     """
     3° et 4° ÉTAPES: Traitement adaptatif parallèle chunk par chunk
     """
-    audio_file = "gros16_enhanced.wav"
+    if audio_file is None:
+        audio_file = "gros16_enhanced.wav"  # Défaut
     
     if not os.path.exists(audio_file):
         print(f"❌ Fichier {audio_file} non trouvé")
         return
     
+    print(f"🎵 Fichier audio: {audio_file}")
     start_time = time.time()
     
     # ÉTAPE 1: Analyse globale
@@ -450,12 +500,12 @@ def parallel_transcription_main():
     # ÉTAPE 2: Calibration sur échantillon (utilise les paramètres optimaux)
     best_params = calibrate_on_sample(audio_file, candidate_params)
     
-    # ÉTAPE 3: Préparation des chunks avec analyse
-    print(f"\n🔍 ÉTAPE 3: Analyse et préparation des chunks")
+    # ÉTAPE 3: Préparation des chunks avec analyse adaptative
+    print(f"\n🔍 ÉTAPE 3: Analyse et préparation des chunks adaptatifs")
     print("-" * 60)
     
     total_duration = global_characteristics['duration']
-    chunk_size = 30  # Augmenté de 25s à 30s pour plus de contexte
+    chunk_size = 30  # secondes
     num_chunks = int(np.ceil(total_duration / chunk_size))
     optimal_workers = get_optimal_worker_count()
     
@@ -463,10 +513,12 @@ def parallel_transcription_main():
     print(f"📦 Nombre de chunks: {num_chunks}")
     print(f"🎯 Paramètres de base: {best_params}")
     print(f"🚀 Workers parallèles: {optimal_workers}")
+    print(f"🧠 Mode: Adaptation dynamique par chunk")
     
-    # Pré-analyser tous les chunks et préparer les tâches
+    # Pré-analyser tous les chunks et adapter les paramètres
     tasks = []
-    print(f"\n📊 Pré-analyse des chunks:")
+    adaptations_count = 0
+    print(f"\n📊 Adaptation des paramètres par chunk:")
     
     for i in range(num_chunks):
         start_chunk = i * chunk_size
@@ -477,10 +529,14 @@ def parallel_transcription_main():
         # Analyser les caractéristiques du chunk
         chunk_characteristics = analyze_chunk_characteristics(audio_file, start_chunk, end_chunk)
         
-        # Utiliser les paramètres optimaux sans ajustement pour éviter la dégradation
-        adjusted_params = best_params.copy()
+        # Ajuster les paramètres pour ce chunk
+        adjusted_params = adjust_parameters_for_chunk(best_params, chunk_characteristics, global_characteristics)
         
-        print(f"✅ Paramètres optimaux")
+        if adjusted_params != best_params:
+            adaptations_count += 1
+            print(f"🔧 Adapté (th={adjusted_params['threshold']:.2f}, sil={adjusted_params['min_silence_duration_ms']}ms)")
+        else:
+            print(f"✅ Standard")
         
         # Créer la tâche
         task = ChunkTask(
@@ -494,8 +550,10 @@ def parallel_transcription_main():
         
         tasks.append(pickle.dumps(task))
     
-    # ÉTAPE 4: Transcription parallèle
-    print(f"\n🚀 ÉTAPE 4: Transcription parallèle")
+    print(f"\n🔧 Adaptations prévues: {adaptations_count}/{num_chunks} chunks ({adaptations_count/num_chunks*100:.1f}%)")
+    
+    # ÉTAPE 4: Transcription parallèle adaptative
+    print(f"\n🚀 ÉTAPE 4: Transcription parallèle adaptative")
     print("-" * 60)
     
     all_segments = []
@@ -524,7 +582,7 @@ def parallel_transcription_main():
                           f"{len(result.segments)} segments, "
                           f"confiance: {result.confidence:.3f}, "
                           f"temps: {result.processing_time:.1f}s "
-                          f"(worker {result.worker_id})")
+                          f"(worker {result.worker_id}) - {result.error}")
                 else:
                     print(f"❌ Chunk {result.index+1}/{num_chunks} échoué: {result.error}")
                 
@@ -546,12 +604,13 @@ def parallel_transcription_main():
     total_time = time.time() - start_time
     
     if all_segments:
-        print(f"\n🎉 TRANSCRIPTION PARALLÈLE TERMINÉE")
+        print(f"\n🎉 TRANSCRIPTION ADAPTATIVE TERMINÉE")
         print("-" * 50)
         print(f"📝 Segments totaux: {len(all_segments)}")
         print(f"🎭 Confiance moyenne: {np.mean([s.avg_logprob for s in all_segments]):.3f}")
         print(f"⏱️ Temps total: {format_time(total_time)}")
         print(f"🚀 Accélération estimée: ~{optimal_workers:.1f}x vs séquentiel")
+        print(f"🧠 Adaptations appliquées: {adaptations_count}/{num_chunks} chunks")
         
         # Statistiques par worker
         worker_stats = {}
@@ -572,7 +631,8 @@ def parallel_transcription_main():
                   f"temps moyen: {avg_time:.1f}s/chunk")
         
         # Sauvegarde
-        save_results(all_segments, audio_file, "_parallel")
+        save_results(all_segments, audio_file, "_adaptive")
+        
     else:
         print("❌ Aucun segment transcrit")
 
@@ -604,4 +664,13 @@ if __name__ == "__main__":
     print("Optimisée pour MacBook M3 - Multi-threading intelligent")
     print("="*70)
     
-    parallel_transcription_main() 
+    parser = argparse.ArgumentParser(description="Script de transcription adaptative multi-threadée")
+    parser.add_argument("audio_file", nargs='?', help="Fichier audio à transcrire")
+    args = parser.parse_args()
+    
+    if args.audio_file:
+        audio_file = args.audio_file
+    else:
+        audio_file = "gros16_enhanced.wav"  # Défaut si aucun fichier fourni
+    
+    parallel_transcription_main(audio_file) 
