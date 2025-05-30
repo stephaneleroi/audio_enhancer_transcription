@@ -1,0 +1,26 @@
+{
+  "mean_energy": 0.06375063210725784,
+  "energy_std": 0.0771857276558876,
+  "dynamic_range": 0.6494427919387817,
+  "energy_percentiles": [
+    7.606471626786515e-05,
+    0.00032867091940715906,
+    0.004676104988902807,
+    0.034364935010671616,
+    0.09952826797962189,
+    0.16386132538318635,
+    0.21259936094284063
+  ],
+  "spectral_center": 1642.2370528394817,
+  "spectral_rolloff": 3076.012530966489,
+  "spectral_bandwidth": 1543.2039390685347,
+  "silence_threshold": 0.00032867091940715906,
+  "snr_estimate": 56.63233280181885,
+  "weak_voice_ratio": 0.2499973845268609,
+  "very_weak_ratio": 0.10000523094627818,
+  "recording_quality": "high",
+  "duration": 955.8465625,
+  "sample_rate": 16000,
+  "analysis_timestamp": 1748614468.8421462,
+  "source_file": "gros.wav"
+}

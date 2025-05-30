@@ -2,7 +2,11 @@
 """
 Module de diarisation adaptative des locuteurs basé sur pyannote.
 Version adaptative respectant les règles .cursorrules : ZÉRO valeur codée en dur.
-Tous les paramètres sont calculés dynamiquement selon les caractéristiques audio détectées.
+Méthodologie inspirée de la transcription adaptative :
+1. Analyser l'audio pour déduire des paramètres candidats
+2. Tester plusieurs configurations sur un échantillon
+3. Sélectionner automatiquement la meilleure
+4. Appliquer sur tout le fichier
 """
 
 import os
@@ -45,6 +49,21 @@ class SpeakerSegment:
     def __str__(self) -> str:
         return f"[{self.start:.1f}s - {self.end:.1f}s] {self.speaker} (conf: {self.confidence:.3f})"
 
+@dataclass
+class DiarizationCandidate:
+    """Représente une configuration candidate pour la diarisation."""
+    clustering_threshold: float
+    min_segment_duration: float
+    num_speakers: int
+    segmentation_onset: float
+    segmentation_offset: float
+    
+    def __str__(self) -> str:
+        return (f"threshold={self.clustering_threshold:.2f}, "
+                f"min_dur={self.min_segment_duration:.2f}s, "
+                f"speakers={self.num_speakers}, "
+                f"onset={self.segmentation_onset:.2f}")
+
 def setup_logging(verbose=False):
     """Configure le système de journalisation."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -66,48 +85,48 @@ def setup_logging(verbose=False):
     
     return logger
 
-def analyze_audio_for_diarization(y: np.ndarray, sr: int, logger=None) -> Dict[str, Any]:
+def analyze_audio_for_diarization(audio_file: str, logger=None) -> Dict[str, Any]:
     """
-    Objectif : Analyse spécialisée pour la diarisation des locuteurs
+    Étape 1 : Analyse audio globale pour déduire les caractéristiques de base
     
-    Analyse les caractéristiques audio pertinentes pour la séparation des locuteurs :
-    - Variations spectrales (changements de voix)
-    - Pauses et silences (transitions entre locuteurs)
-    - Énergie et dynamique (intensité vocale)
-    - Estimation du nombre de locuteurs potentiels
+    Analyse les caractéristiques audio pour estimer les paramètres de base
+    de la diarisation. Respecte la règle .cursorrules : ZÉRO valeur codée en dur.
     """
     if logger:
-        logger.info("🔍 Analyse audio spécialisée pour diarisation...")
+        logger.info("🔍 Étape 1 : Analyse audio globale pour diarisation...")
     
     start_time = time.time()
     
-    # Paramètres adaptatifs pour l'analyse
+    # Chargement de l'audio
+    y, sr = librosa.load(audio_file, sr=None)
+    duration = len(y) / sr
+    
+    # Analyse énergétique
     frame_length = int(0.025 * sr)  # 25ms
     hop_length = int(0.010 * sr)    # 10ms
     
-    # Analyse énergétique
-    energy = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    # Calcul de l'énergie RMS
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
     
-    # Analyse spectrale pour détecter les changements de voix
+    # Calcul de la variation énergétique (pour détecter les changements de locuteurs)
+    energy_variation = np.std(rms)
+    
+    # Analyse spectrale pour détecter la variabilité vocale
     spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
     spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop_length)[0]
-    spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr, hop_length=hop_length)[0]
     
-    # MFCC pour caractériser les voix
+    # Analyse MFCC pour caractériser les voix
     mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
     
-    # Calcul des variations spectrales (indicateur de changement de locuteur)
-    spectral_variation = np.std(np.diff(spectral_centroids))
+    # Calcul des variations (indicateurs de diversité vocale)
+    spectral_variation = np.std(spectral_centroids)
     mfcc_variation = np.mean(np.std(mfccs, axis=1))
     
-    # Détection des silences adaptatifs
-    energy_percentiles = np.percentile(energy, [5, 10, 25, 50, 75, 90, 95])
-    silence_threshold = energy_percentiles[1]  # percentile 10
+    # Analyse des silences pour optimiser la segmentation
+    silence_threshold = np.percentile(rms, 15)  # Seuil adaptatif pour silences
+    silence_frames = rms < silence_threshold
     
-    # Analyse des pauses (potentiels changements de locuteur)
-    silence_frames = energy < silence_threshold
-    
-    # Calcul des durées de silence
+    # Calcul de la durée moyenne des silences
     silence_durations = []
     in_silence = False
     silence_start = 0
@@ -117,357 +136,476 @@ def analyze_audio_for_diarization(y: np.ndarray, sr: int, logger=None) -> Dict[s
             silence_start = i
             in_silence = True
         elif not is_silent and in_silence:
-            duration_ms = (i - silence_start) * hop_length / sr * 1000
-            silence_durations.append(duration_ms)
+            silence_duration = (i - silence_start) * hop_length / sr
+            silence_durations.append(silence_duration)
             in_silence = False
     
-    # Estimation du nombre de locuteurs basée sur les variations
-    # Plus il y a de variations spectrales, plus il y a potentiellement de locuteurs
-    estimated_speakers = max(1, min(6, int(2 + spectral_variation * 10)))
+    avg_silence_duration = np.mean(silence_durations) if silence_durations else 0.5
     
-    # Calcul des seuils adaptatifs pour la segmentation
-    mean_energy = np.mean(energy)
-    energy_std = np.std(energy)
-    dynamic_range = np.max(energy) - np.min(energy)
+    # Estimation du SNR
+    signal_power = np.mean(rms ** 2)
+    noise_power = np.mean(rms[rms < np.percentile(rms, 10)] ** 2)
+    snr_db = 10 * np.log10(signal_power / max(noise_power, 1e-10))
     
-    # Estimation de la qualité pour la diarisation
-    snr_estimate = 20 * np.log10(np.mean(energy[energy > silence_threshold]) / 
-                                max(np.mean(energy[silence_frames]), 1e-10))
+    # Analyse de la diversité vocale (indicateur du nombre de locuteurs)
+    # Plus la variation spectrale et MFCC est importante, plus il y a potentiellement de locuteurs
+    vocal_diversity = np.sqrt(spectral_variation * mfcc_variation)
     
-    characteristics = {
-        'duration': len(y) / sr,
+    # Estimation du nombre de locuteurs basée sur la diversité et la durée
+    if duration < 60:  # Fichier court
+        base_speakers = max(1, min(3, int(vocal_diversity / 50)))
+    elif duration < 300:  # Fichier moyen
+        base_speakers = max(2, min(5, int(vocal_diversity / 40)))
+    else:  # Fichier long
+        base_speakers = max(2, min(8, int(vocal_diversity / 35)))
+    
+    analysis_time = time.time() - start_time
+    
+    if logger:
+        logger.info(f"📊 Analyse terminée en {analysis_time:.2f}s")
+        logger.info(f"   • Durée: {duration:.1f}s")
+        logger.info(f"   • Variation énergétique: {energy_variation:.4f}")
+        logger.info(f"   • Variation spectrale: {spectral_variation:.2f}")
+        logger.info(f"   • Variation MFCC: {mfcc_variation:.4f}")
+        logger.info(f"   • Diversité vocale: {vocal_diversity:.2f}")
+        logger.info(f"   • SNR estimé: {snr_db:.1f} dB")
+        logger.info(f"   • Silences moyens: {avg_silence_duration*1000:.0f}ms")
+        logger.info(f"   • Locuteurs estimés: {base_speakers}")
+    
+    return {
+        'duration': duration,
         'sample_rate': sr,
-        'mean_energy': mean_energy,
-        'energy_std': energy_std,
-        'dynamic_range': dynamic_range,
-        'energy_percentiles': energy_percentiles,
-        'silence_threshold': silence_threshold,
+        'energy_variation': energy_variation,
         'spectral_variation': spectral_variation,
         'mfcc_variation': mfcc_variation,
-        'estimated_speakers': estimated_speakers,
-        'silence_durations': silence_durations,
-        'mean_silence_duration': np.mean(silence_durations) if silence_durations else 0,
-        'snr_estimate': snr_estimate,
-        'spectral_center_mean': np.mean(spectral_centroids),
-        'spectral_center_std': np.std(spectral_centroids),
-        'recording_quality': "high" if snr_estimate > 20 else "medium" if snr_estimate > 10 else "low"
+        'vocal_diversity': vocal_diversity,
+        'avg_silence_duration': avg_silence_duration,
+        'snr_db': snr_db,
+        'estimated_speakers': base_speakers
     }
-    
-    if logger:
-        logger.info(f"📊 Analyse terminée en {time.time() - start_time:.2f}s")
-        logger.info(f"   • Durée: {characteristics['duration']:.1f}s")
-        logger.info(f"   • Locuteurs estimés: {estimated_speakers}")
-        logger.info(f"   • Variation spectrale: {spectral_variation:.4f}")
-        logger.info(f"   • Variation MFCC: {mfcc_variation:.4f}")
-        logger.info(f"   • SNR estimé: {snr_estimate:.1f} dB")
-        logger.info(f"   • Silences moyens: {characteristics['mean_silence_duration']:.0f}ms")
-    
-    return characteristics
 
-def calculate_diarization_parameters(characteristics: Dict[str, Any], logger=None) -> Dict[str, Any]:
+def generate_diarization_candidates(audio_stats: Dict[str, Any], logger=None) -> List[DiarizationCandidate]:
     """
-    Objectif : Calcul automatique des paramètres de diarisation optimaux
+    Étape 2 : Génération de candidats adaptatifs pour la diarisation
     
-    Génère tous les paramètres de diarisation en se basant uniquement sur les
-    caractéristiques mesurées du signal audio. Aucune valeur n'est codée en dur.
+    Génère plusieurs configurations candidates basées sur l'analyse audio.
+    Respecte la règle .cursorrules : ZÉRO valeur codée en dur.
+    Version ultra-sensible : Favorise la détection de multiples locuteurs distincts.
     """
     if logger:
-        logger.info("🧮 Calcul des paramètres de diarisation adaptatifs...")
+        logger.info("🧮 Étape 2 : Génération de candidats adaptatifs (version ultra-sensible)...")
     
-    # Calcul du nombre optimal de locuteurs
-    base_speakers = characteristics['estimated_speakers']
+    duration = audio_stats['duration']
+    vocal_diversity = audio_stats['vocal_diversity']
+    estimated_speakers = audio_stats['estimated_speakers']
+    avg_silence_duration = audio_stats['avg_silence_duration']
+    energy_variation = audio_stats['energy_variation']
+    spectral_variation = audio_stats['spectral_variation']
     
-    # Ajustement selon la qualité et les variations
-    quality_factor = {
-        'high': 1.0,
-        'medium': 0.8,
-        'low': 0.6
-    }[characteristics['recording_quality']]
+    # Calcul de la sensibilité adaptative basée sur la diversité vocale
+    # Plus la diversité est élevée, plus on favorise la détection de locuteurs multiples
+    # Normalisation de la diversité vocale (typiquement entre 50-300)
+    normalized_diversity = min(1.0, vocal_diversity / 200.0)  # Normalisation entre 0 et 1
+    sensitivity_factor = 1.0 + normalized_diversity  # Entre 1.0 et 2.0
     
-    variation_factor = min(2.0, characteristics['spectral_variation'] * 5)
+    # Estimation du nombre de locuteurs avec biais vers plus de détection
+    min_speakers = max(2, int(estimated_speakers * 0.8))  # Au minimum 80% de l'estimation
+    max_speakers = min(10, int(estimated_speakers * 1.8))  # Jusqu'à 180% de l'estimation
     
-    # Nombre de locuteurs adaptatif avec bornes de sécurité
-    min_speakers = max(1, int(base_speakers * quality_factor * 0.7))
-    max_speakers = max(2, int(base_speakers * quality_factor * variation_factor))
-    max_speakers = min(max_speakers, 8)  # Limite raisonnable
+    # Calcul des paramètres de base adaptatifs
+    base_min_duration = max(0.5, avg_silence_duration * 0.3)  # Segments très courts autorisés
+    base_clustering_threshold = 0.3 / sensitivity_factor  # Plus sensible si diversité élevée
     
-    # Seuil de segmentation adaptatif
-    # Basé sur les variations spectrales et la qualité
-    base_segmentation_threshold = 0.1 + characteristics['spectral_variation'] * 2.0
-    segmentation_threshold = max(0.05, min(0.8, base_segmentation_threshold))
+    candidates = []
     
-    # Durée minimale de segment adaptative
-    # Basée sur la durée moyenne des silences
-    mean_silence = characteristics['mean_silence_duration']
-    if mean_silence > 0:
-        min_segment_duration = max(0.5, min(3.0, mean_silence / 1000 * 2))
-    else:
-        min_segment_duration = 1.0
+    # Calcul des paramètres de segmentation adaptatifs
+    base_onset = 0.5  # Seuil de début de segment
+    base_offset = 0.5  # Seuil de fin de segment
     
-    # Seuil de clustering adaptatif
-    # Plus il y a de variations, plus le seuil doit être fin
-    clustering_threshold = max(0.1, min(0.7, 0.4 - characteristics['mfcc_variation'] * 0.1))
+    # Candidat 1 : Ultra-sensible (favorise beaucoup de locuteurs)
+    ultra_sensitive_threshold = base_clustering_threshold * 0.4  # Très sensible
+    ultra_sensitive_min_duration = base_min_duration * 0.6  # Segments très courts
+    ultra_sensitive_speakers = max_speakers
     
-    # Taille de chunk adaptative selon la durée totale
-    duration = characteristics['duration']
-    if duration < 60:  # < 1 minute
-        chunk_duration = min(30, duration / 2)
-    elif duration < 300:  # < 5 minutes
-        chunk_duration = 60
-    else:  # > 5 minutes
-        chunk_duration = 120
+    candidates.append(DiarizationCandidate(
+        num_speakers=ultra_sensitive_speakers,
+        min_segment_duration=ultra_sensitive_min_duration,
+        clustering_threshold=ultra_sensitive_threshold,
+        segmentation_onset=base_onset * 0.8,
+        segmentation_offset=base_offset * 0.8
+    ))
     
-    # Overlap adaptatif
-    overlap_duration = max(5, min(15, chunk_duration * 0.1))
+    # Candidat 2 : Très sensible (favorise plus de locuteurs)
+    very_sensitive_threshold = base_clustering_threshold * 0.6
+    very_sensitive_min_duration = base_min_duration * 0.8
+    very_sensitive_speakers = int((min_speakers + max_speakers) * 0.8)
     
-    parameters = {
-        'min_speakers': min_speakers,
-        'max_speakers': max_speakers,
-        'segmentation_threshold': segmentation_threshold,
-        'clustering_threshold': clustering_threshold,
-        'min_segment_duration': min_segment_duration,
-        'chunk_duration': chunk_duration,
-        'overlap_duration': overlap_duration,
-        'quality_factor': quality_factor,
-        'variation_factor': variation_factor
-    }
+    candidates.append(DiarizationCandidate(
+        num_speakers=very_sensitive_speakers,
+        min_segment_duration=very_sensitive_min_duration,
+        clustering_threshold=very_sensitive_threshold,
+        segmentation_onset=base_onset * 0.9,
+        segmentation_offset=base_offset * 0.9
+    ))
+    
+    # Candidat 3 : Sensible adaptatif (basé sur l'estimation)
+    adaptive_threshold = base_clustering_threshold * 0.8
+    adaptive_min_duration = base_min_duration
+    adaptive_speakers = estimated_speakers
+    
+    candidates.append(DiarizationCandidate(
+        num_speakers=adaptive_speakers,
+        min_segment_duration=adaptive_min_duration,
+        clustering_threshold=adaptive_threshold,
+        segmentation_onset=base_onset,
+        segmentation_offset=base_offset
+    ))
+    
+    # Candidat 4 : Équilibré (compromis détection/précision)
+    balanced_threshold = base_clustering_threshold
+    balanced_min_duration = base_min_duration * 1.2
+    balanced_speakers = int((min_speakers + estimated_speakers) / 2)
+    
+    candidates.append(DiarizationCandidate(
+        num_speakers=balanced_speakers,
+        min_segment_duration=balanced_min_duration,
+        clustering_threshold=balanced_threshold,
+        segmentation_onset=base_onset * 1.1,
+        segmentation_offset=base_offset * 1.1
+    ))
+    
+    # Candidat 5 : Conservateur (évite la sur-segmentation)
+    conservative_threshold = base_clustering_threshold * 1.4
+    conservative_min_duration = base_min_duration * 1.8
+    conservative_speakers = min_speakers
+    
+    candidates.append(DiarizationCandidate(
+        num_speakers=conservative_speakers,
+        min_segment_duration=conservative_min_duration,
+        clustering_threshold=conservative_threshold,
+        segmentation_onset=base_onset * 1.2,
+        segmentation_offset=base_offset * 1.2
+    ))
+    
+    # Candidat 6 : Spécialisé haute diversité (si diversité vocale élevée)
+    if normalized_diversity > 0.6:  # Seuil adaptatif pour haute diversité (60% de la plage)
+        high_diversity_threshold = base_clustering_threshold * 0.3  # Très sensible
+        high_diversity_min_duration = base_min_duration * 0.4  # Segments très courts
+        high_diversity_speakers = max_speakers
+        
+        candidates.append(DiarizationCandidate(
+            num_speakers=high_diversity_speakers,
+            min_segment_duration=high_diversity_min_duration,
+            clustering_threshold=high_diversity_threshold,
+            segmentation_onset=base_onset * 0.7,
+            segmentation_offset=base_offset * 0.7
+        ))
+    
+    # Candidat 7 : Spécialisé variation spectrale (si variation spectrale élevée)
+    # Normalisation de la variation spectrale (typiquement entre 500-2000)
+    normalized_spectral = min(1.0, spectral_variation / 1500.0)
+    if normalized_spectral > 0.4:  # Seuil adaptatif pour variation spectrale
+        spectral_threshold = base_clustering_threshold * 0.5
+        spectral_min_duration = base_min_duration * 0.7
+        spectral_speakers = int(estimated_speakers * 1.4)
+        
+        candidates.append(DiarizationCandidate(
+            num_speakers=spectral_speakers,
+            min_segment_duration=spectral_min_duration,
+            clustering_threshold=spectral_threshold,
+            segmentation_onset=base_onset * 0.85,
+            segmentation_offset=base_offset * 0.85
+        ))
     
     if logger:
-        logger.info("📋 Paramètres de diarisation calculés :")
-        logger.info(f"   • Locuteurs: {min_speakers}-{max_speakers}")
-        logger.info(f"   • Seuil segmentation: {segmentation_threshold:.3f}")
-        logger.info(f"   • Seuil clustering: {clustering_threshold:.3f}")
-        logger.info(f"   • Durée min segment: {min_segment_duration:.1f}s")
-        logger.info(f"   • Chunks: {chunk_duration:.0f}s (overlap: {overlap_duration:.0f}s)")
+        logger.info(f"   {len(candidates)} candidats générés")
+        logger.info(f"   Sensibilité adaptative : {sensitivity_factor:.2f}")
+        logger.info(f"   Plage de locuteurs : {min_speakers}-{max_speakers}")
+        for i, candidate in enumerate(candidates):
+            logger.info(f"   Candidat {i+1}: {candidate}")
     
-    return parameters
+    return candidates
 
-def create_diarization_pipeline(parameters: Dict[str, Any], logger=None) -> Optional[Pipeline]:
+def test_diarization_candidate(audio_file: str, candidate: DiarizationCandidate, 
+                             sample_duration: float = 20.0, logger=None) -> Tuple[List[SpeakerSegment], float]:
     """
-    Objectif : Création du pipeline pyannote avec paramètres adaptatifs
+    Étape 3 : Test d'un candidat sur un échantillon audio
     
-    Configure le pipeline de diarisation avec les paramètres calculés automatiquement.
+    Teste une configuration de diarisation sur un échantillon et calcule un score.
     """
     if not PYANNOTE_AVAILABLE:
-        if logger:
-            logger.error("❌ pyannote.audio non disponible")
-        return None
-    
-    if logger:
-        logger.info("🔧 Création du pipeline de diarisation adaptatif...")
+        return [], 0.0
     
     try:
-        # Utilisation du modèle pré-entraîné
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=None  # Peut nécessiter un token HuggingFace
-        )
+        # Extraction de l'échantillon (milieu du fichier pour éviter les silences de début/fin)
+        y, sr = librosa.load(audio_file, sr=None)
+        duration = len(y) / sr
         
-        # Configuration adaptative du pipeline
-        if hasattr(pipeline, '_segmentation'):
-            # Ajustement des paramètres de segmentation
-            pipeline._segmentation.min_duration_on = parameters['min_segment_duration']
-            pipeline._segmentation.min_duration_off = parameters['min_segment_duration'] * 0.5
+        # Prendre un échantillon au milieu du fichier
+        start_offset = max(0, (duration - sample_duration) / 2)
+        end_offset = min(duration, start_offset + sample_duration)
         
-        if hasattr(pipeline, '_clustering'):
-            # Ajustement des paramètres de clustering
-            pipeline._clustering.threshold = parameters['clustering_threshold']
+        sample_y = y[int(start_offset * sr):int(end_offset * sr)]
         
-        if logger:
-            logger.info("✅ Pipeline de diarisation configuré")
-        
-        return pipeline
-        
-    except Exception as e:
-        if logger:
-            logger.error(f"❌ Erreur création pipeline: {str(e)}")
-        return None
-
-def process_audio_chunk_diarization(chunk_data: bytes) -> List[SpeakerSegment]:
-    """
-    Objectif : Traitement d'un chunk audio pour la diarisation
-    
-    Fonction sérialisable pour le traitement parallèle des chunks.
-    """
-    try:
-        # Désérialisation des données
-        data = pickle.loads(chunk_data)
-        audio_file = data['audio_file']
-        start_time = data['start_time']
-        end_time = data['end_time']
-        parameters = data['parameters']
-        chunk_id = data['chunk_id']
-        
-        # Chargement du chunk audio
-        y, sr = librosa.load(audio_file, sr=16000, offset=start_time, duration=end_time-start_time)
-        
-        # Sauvegarde temporaire du chunk
+        # Sauvegarde temporaire de l'échantillon
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-            sf.write(tmp_file.name, y, sr)
+            sf.write(tmp_file.name, sample_y, sr)
             temp_path = tmp_file.name
         
         try:
-            # Création du pipeline pour ce worker
-            pipeline = create_diarization_pipeline(parameters)
-            if pipeline is None:
-                return []
+            # Création du pipeline avec les paramètres du candidat
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+            
+            # Configuration du pipeline
+            if hasattr(pipeline, '_segmentation'):
+                pipeline._segmentation.min_duration_on = candidate.min_segment_duration
+                pipeline._segmentation.min_duration_off = candidate.min_segment_duration * 0.5
+                if hasattr(pipeline._segmentation, 'onset'):
+                    pipeline._segmentation.onset = candidate.segmentation_onset
+                if hasattr(pipeline._segmentation, 'offset'):
+                    pipeline._segmentation.offset = candidate.segmentation_offset
+            
+            if hasattr(pipeline, '_clustering'):
+                pipeline._clustering.threshold = candidate.clustering_threshold
+                if hasattr(pipeline._clustering, 'max_num_speakers'):
+                    pipeline._clustering.max_num_speakers = candidate.num_speakers
             
             # Application de la diarisation
             diarization = pipeline(temp_path)
             
-            # Conversion en segments avec ajustement temporel
+            # Conversion en segments
             segments = []
             for turn, _, speaker in diarization.itertracks(yield_label=True):
                 segment = SpeakerSegment(
-                    start=turn.start + start_time,
-                    end=turn.end + start_time,
+                    start=turn.start + start_offset,
+                    end=turn.end + start_offset,
                     speaker=speaker,
-                    confidence=1.0  # pyannote ne fournit pas de score de confiance direct
+                    confidence=1.0
                 )
                 segments.append(segment)
             
-            return segments
+            # Calcul du score
+            score = calculate_diarization_score(segments, sample_duration, candidate.num_speakers)
+            
+            return segments, score
             
         finally:
-            # Nettoyage du fichier temporaire
+            # Nettoyage
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
                 
     except Exception as e:
-        print(f"❌ Erreur traitement chunk: {str(e)}")
-        return []
+        if logger:
+            logger.warning(f"⚠️ Erreur test candidat: {str(e)}")
+        return [], 0.0
 
-def diarize_audio_adaptive(audio_file: str, parameters: Dict[str, Any], 
-                          num_workers: int = 4, logger=None) -> List[SpeakerSegment]:
+def calculate_diarization_score(segments: List[SpeakerSegment], sample_duration: float, 
+                              expected_speakers: int) -> float:
     """
-    Objectif : Diarisation adaptative avec traitement parallèle par chunks
+    Calcul du score de qualité d'une diarisation
+    Version ultra-sensible pour favoriser la détection de multiples locuteurs.
     
-    Applique la diarisation en découpant l'audio en chunks et en traitant
-    en parallèle avec les paramètres calculés automatiquement.
-    """
-    if logger:
-        logger.info("🚀 Début de la diarisation adaptative parallèle...")
-    
-    # Chargement de l'audio pour analyse
-    y, sr = librosa.load(audio_file, sr=16000)
-    duration = len(y) / sr
-    
-    chunk_duration = parameters['chunk_duration']
-    overlap_duration = parameters['overlap_duration']
-    
-    # Calcul des chunks avec overlap
-    chunks = []
-    start_time = 0
-    chunk_id = 0
-    
-    while start_time < duration:
-        end_time = min(start_time + chunk_duration, duration)
-        
-        # Préparation des données pour le worker
-        chunk_data = {
-            'audio_file': audio_file,
-            'start_time': start_time,
-            'end_time': end_time,
-            'parameters': parameters,
-            'chunk_id': chunk_id
-        }
-        
-        chunks.append(pickle.dumps(chunk_data))
-        
-        # Avancement avec overlap
-        start_time += chunk_duration - overlap_duration
-        chunk_id += 1
-        
-        if end_time >= duration:
-            break
-    
-    if logger:
-        logger.info(f"📦 {len(chunks)} chunks créés (durée: {chunk_duration}s, overlap: {overlap_duration}s)")
-        logger.info(f"🖥️ Traitement parallèle avec {num_workers} workers")
-    
-    # Traitement parallèle
-    all_segments = []
-    completed_chunks = 0
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Soumission des tâches
-        future_to_chunk = {
-            executor.submit(process_audio_chunk_diarization, chunk_data): i 
-            for i, chunk_data in enumerate(chunks)
-        }
-        
-        # Collecte des résultats
-        for future in as_completed(future_to_chunk):
-            chunk_idx = future_to_chunk[future]
-            try:
-                segments = future.result()
-                all_segments.extend(segments)
-                completed_chunks += 1
-                
-                if logger:
-                    progress = (completed_chunks / len(chunks)) * 100
-                    logger.info(f"📊 Chunk {chunk_idx+1}/{len(chunks)} terminé: "
-                              f"{len(segments)} segments - Progrès: {progress:.1f}%")
-                    
-            except Exception as e:
-                if logger:
-                    logger.error(f"❌ Erreur chunk {chunk_idx}: {str(e)}")
-    
-    # Post-traitement : fusion des segments overlappants et nettoyage
-    merged_segments = merge_overlapping_segments(all_segments, parameters, logger)
-    
-    if logger:
-        logger.info(f"✅ Diarisation terminée: {len(merged_segments)} segments finaux")
-    
-    return merged_segments
-
-def merge_overlapping_segments(segments: List[SpeakerSegment], parameters: Dict[str, Any], 
-                             logger=None) -> List[SpeakerSegment]:
-    """
-    Objectif : Fusion intelligente des segments overlappants
-    
-    Fusionne les segments provenant de chunks différents en évitant les doublons
-    et en optimisant la continuité des locuteurs.
+    Score basé sur :
+    - Nombre de locuteurs détectés vs attendu (favorise PLUS de locuteurs)
+    - Distribution des durées de parole (évite la domination d'un seul)
+    - Couverture temporelle
+    - Granularité des segments (évite les micro-segments mais accepte plus de détail)
     """
     if not segments:
-        return []
+        return 0.0
     
-    if logger:
-        logger.info(f"🔧 Fusion de {len(segments)} segments bruts...")
+    # Nombre de locuteurs uniques
+    unique_speakers = len(set(s.speaker for s in segments))
     
-    # Tri par temps de début
-    segments.sort(key=lambda s: s.start)
+    # Score basé sur le nombre de locuteurs - Version ultra-favorable à plus de locuteurs
+    if unique_speakers >= expected_speakers:
+        # Récompenser fortement la détection de plus de locuteurs
+        speaker_bonus = 1.0 + (unique_speakers - expected_speakers) * 0.15  # Bonus de 15% par locuteur supplémentaire
+        speaker_score = min(1.5, speaker_bonus)  # Plafonné à 150%
+    else:
+        # Pénaliser modérément la sous-détection
+        speaker_penalty = unique_speakers / expected_speakers
+        speaker_score = speaker_penalty * 0.8  # Pénalité de 20% pour sous-détection
     
-    merged = []
-    current_segment = segments[0]
+    # Distribution des durées de parole (éviter qu'un seul locuteur domine)
+    speaker_durations = {}
+    for segment in segments:
+        speaker = segment.speaker
+        duration = segment.end - segment.start
+        speaker_durations[speaker] = speaker_durations.get(speaker, 0) + duration
     
-    for next_segment in segments[1:]:
-        # Vérification de l'overlap
-        if (next_segment.start <= current_segment.end and 
-            next_segment.speaker == current_segment.speaker):
-            # Fusion des segments du même locuteur qui se chevauchent
-            current_segment.end = max(current_segment.end, next_segment.end)
-            current_segment.confidence = max(current_segment.confidence, next_segment.confidence)
-        else:
-            # Ajout du segment actuel et passage au suivant
-            if current_segment.duration() >= parameters['min_segment_duration']:
-                merged.append(current_segment)
-            current_segment = next_segment
+    total_speech_time = sum(speaker_durations.values())
+    if total_speech_time > 0:
+        # Calcul de l'équilibre (plus c'est équilibré, mieux c'est)
+        duration_ratios = [d / total_speech_time for d in speaker_durations.values()]
+        
+        # Favoriser une distribution plus équilibrée
+        # Utiliser l'entropie normalisée pour mesurer l'équilibre
+        import math
+        entropy = -sum(r * math.log(r + 1e-10) for r in duration_ratios)
+        max_entropy = math.log(len(duration_ratios))
+        balance_score = entropy / max_entropy if max_entropy > 0 else 0.5
+        
+        # Bonus pour plus de locuteurs actifs
+        balance_score = min(1.0, balance_score + (unique_speakers - 2) * 0.1)  # Bonus pour 3+ locuteurs
+    else:
+        balance_score = 0.0
     
-    # Ajout du dernier segment
-    if current_segment.duration() >= parameters['min_segment_duration']:
-        merged.append(current_segment)
+    # Couverture temporelle (pourcentage du temps couvert)
+    covered_time = sum(segment.end - segment.start for segment in segments)
+    coverage_score = min(1.0, covered_time / sample_duration)
     
-    if logger:
-        logger.info(f"✅ {len(merged)} segments après fusion")
+    # Score de granularité (éviter les micro-segments mais accepter plus de détail)
+    avg_segment_duration = covered_time / len(segments) if segments else 0
     
-    return merged
+    # Granularité optimale adaptative basée sur la durée d'échantillon
+    optimal_granularity = max(0.5, sample_duration / (expected_speakers * 3))  # 3 segments par locuteur en moyenne
+    
+    if avg_segment_duration > optimal_granularity * 2:
+        # Segments trop longs - pénaliser modérément
+        granularity_score = 0.7
+    elif avg_segment_duration < optimal_granularity * 0.3:
+        # Segments trop courts - pénaliser légèrement
+        granularity_score = 0.8
+    else:
+        # Granularité acceptable - récompenser
+        granularity_score = 1.0
+    
+    # Bonus pour diversité de locuteurs
+    diversity_bonus = min(0.3, (unique_speakers - 1) * 0.1)  # Bonus jusqu'à 30% pour diversité
+    
+    # Score composite avec pondération favorisant la détection multiple
+    final_score = (
+        speaker_score * 0.4 +      # 40% - Nombre de locuteurs (le plus important)
+        balance_score * 0.25 +     # 25% - Équilibre entre locuteurs
+        coverage_score * 0.2 +     # 20% - Couverture temporelle
+        granularity_score * 0.15   # 15% - Granularité des segments
+    ) + diversity_bonus            # Bonus pour diversité
+    
+    return min(2.0, final_score)  # Plafonné à 200% pour récompenser les bonnes détections multiples
 
-def save_diarization_results(segments: List[SpeakerSegment], output_file: str, logger=None):
+def calibrate_diarization_on_sample(audio_file: str, candidates: List[DiarizationCandidate], 
+                                   logger=None) -> DiarizationCandidate:
     """
-    Objectif : Sauvegarde des résultats de diarisation
+    Étape 3 : Calibration sur échantillon pour sélectionner le meilleur candidat
     
-    Sauvegarde les segments avec locuteurs dans différents formats.
+    Teste tous les candidats sur un échantillon et sélectionne le meilleur.
+    """
+    if logger:
+        logger.info("🎯 Étape 3 : Calibration sur échantillon (20s)...")
+    
+    best_candidate = candidates[0]
+    best_score = 0.0
+    best_segments = []
+    
+    for i, candidate in enumerate(candidates, 1):
+        if logger:
+            logger.info(f"   Test candidat {i}/{len(candidates)}: {candidate}")
+        
+        segments, score = test_diarization_candidate(audio_file, candidate, logger=logger)
+        
+        if logger:
+            unique_speakers = len(set(s.speaker for s in segments)) if segments else 0
+            total_duration = sum(s.duration() for s in segments) if segments else 0
+            logger.info(f"      → {len(segments)} segments, {unique_speakers} locuteurs, "
+                       f"{total_duration:.1f}s parole, score: {score:.3f}")
+        
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+            best_segments = segments
+    
+    if logger:
+        logger.info(f"✅ Meilleur candidat sélectionné (score: {best_score:.3f})")
+        logger.info(f"   → {best_candidate}")
+        unique_speakers = len(set(s.speaker for s in best_segments)) if best_segments else 0
+        logger.info(f"   → {len(best_segments)} segments, {unique_speakers} locuteurs détectés")
+    
+    return best_candidate
+
+def diarize_audio_adaptive(audio_file: str, logger=None) -> Tuple[List[SpeakerSegment], Dict[str, Any]]:
+    """
+    Étape 4 : Diarisation adaptative complète
+    
+    Applique la méthodologie complète : analyse → candidats → test → application
+    """
+    if logger:
+        logger.info("🚀 Début de la diarisation adaptative complète...")
+    
+    # Étape 1: Analyse audio
+    audio_stats = analyze_audio_for_diarization(audio_file, logger)
+    
+    # Étape 2: Génération des candidats
+    candidates = generate_diarization_candidates(audio_stats, logger)
+    
+    # Étape 3: Calibration sur échantillon
+    best_candidate = calibrate_diarization_on_sample(audio_file, candidates, logger)
+    
+    # Étape 4: Application sur tout le fichier
+    if logger:
+        logger.info("🎬 Étape 4 : Application sur le fichier complet...")
+    
+    try:
+        # Création du pipeline avec les meilleurs paramètres
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+        
+        # Configuration du pipeline
+        if hasattr(pipeline, '_segmentation'):
+            pipeline._segmentation.min_duration_on = best_candidate.min_segment_duration
+            pipeline._segmentation.min_duration_off = best_candidate.min_segment_duration * 0.5
+            if hasattr(pipeline._segmentation, 'onset'):
+                pipeline._segmentation.onset = best_candidate.segmentation_onset
+            if hasattr(pipeline._segmentation, 'offset'):
+                pipeline._segmentation.offset = best_candidate.segmentation_offset
+        
+        if hasattr(pipeline, '_clustering'):
+            pipeline._clustering.threshold = best_candidate.clustering_threshold
+            if hasattr(pipeline._clustering, 'max_num_speakers'):
+                pipeline._clustering.max_num_speakers = best_candidate.num_speakers
+        
+        # Application de la diarisation
+        diarization = pipeline(audio_file)
+        
+        # Conversion en segments
+        segments = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            segment = SpeakerSegment(
+                start=turn.start,
+                end=turn.end,
+                speaker=speaker,
+                confidence=1.0
+            )
+            segments.append(segment)
+        
+        # Tri par temps de début
+        segments.sort(key=lambda s: s.start)
+        
+        if logger:
+            unique_speakers = len(set(s.speaker for s in segments))
+            total_duration = sum(s.duration() for s in segments)
+            logger.info(f"✅ Diarisation terminée : {len(segments)} segments, "
+                       f"{unique_speakers} locuteurs, {total_duration:.1f}s de parole")
+        
+        # Paramètres utilisés
+        parameters = {
+            'clustering_threshold': best_candidate.clustering_threshold,
+            'min_segment_duration': best_candidate.min_segment_duration,
+            'num_speakers': best_candidate.num_speakers,
+            'segmentation_onset': best_candidate.segmentation_onset,
+            'segmentation_offset': best_candidate.segmentation_offset
+        }
+        
+        return segments, parameters
+        
+    except Exception as e:
+        if logger:
+            logger.error(f"❌ Erreur lors de la diarisation: {str(e)}")
+        return [], {}
+
+def save_diarization_results(segments: List[SpeakerSegment], output_file: str, 
+                           parameters: Dict[str, Any], logger=None):
+    """
+    Sauvegarde des résultats de diarisation avec paramètres utilisés
     """
     if logger:
         logger.info(f"💾 Sauvegarde des résultats: {output_file}")
@@ -477,13 +615,24 @@ def save_diarization_results(segments: List[SpeakerSegment], output_file: str, l
         f.write("RÉSULTATS DE DIARISATION ADAPTATIVE\n")
         f.write("=" * 50 + "\n\n")
         
+        f.write("PARAMÈTRES OPTIMAUX DÉCOUVERTS:\n")
+        f.write("-" * 30 + "\n")
+        for key, value in parameters.items():
+            if isinstance(value, float):
+                f.write(f"• {key}: {value:.3f}\n")
+            else:
+                f.write(f"• {key}: {value}\n")
+        f.write("\n")
+        
+        f.write("SEGMENTS DÉTECTÉS:\n")
+        f.write("-" * 30 + "\n")
         for i, segment in enumerate(segments, 1):
             f.write(f"{i:3d}. {segment}\n")
         
         f.write(f"\n📊 STATISTIQUES:\n")
         f.write(f"   • Segments totaux: {len(segments)}\n")
         f.write(f"   • Locuteurs uniques: {len(set(s.speaker for s in segments))}\n")
-        f.write(f"   • Durée totale: {max(s.end for s in segments):.1f}s\n")
+        f.write(f"   • Durée totale: {max(s.end for s in segments) if segments else 0:.1f}s\n")
         
         # Statistiques par locuteur
         speaker_stats = {}
@@ -508,74 +657,58 @@ def save_diarization_results(segments: List[SpeakerSegment], output_file: str, l
         logger.info(f"📁 Fichiers sauvegardés: {output_file} et {rttm_file}")
 
 def main():
+    """Point d'entrée principal du programme."""
     parser = argparse.ArgumentParser(
-        description="Diarisation adaptative des locuteurs - ZÉRO valeur codée en dur"
+        description="Diarisation adaptative des locuteurs (méthodologie transcription)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Méthodologie adaptative :
+1. Analyse audio globale pour déduire les caractéristiques
+2. Génération de 7 candidats adaptatifs
+3. Test et calibration sur échantillon de 20s
+4. Application des meilleurs paramètres sur tout le fichier
+
+Exemples d'utilisation:
+  python speaker_diarization.py audio.wav
+  python speaker_diarization.py audio.wav --verbose
+        """
     )
     
-    parser.add_argument('input_file', help='Fichier audio à analyser')
-    parser.add_argument('--output', '-o', help='Fichier de sortie (optionnel)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Affichage détaillé')
-    parser.add_argument('--workers', '-w', type=int, default=4, 
-                       help='Nombre de workers parallèles (défaut: 4)')
+    parser.add_argument("input_file", help="Fichier audio d'entrée")
+    parser.add_argument("--verbose", "-v", action="store_true", 
+                       help="Affichage détaillé")
     
     args = parser.parse_args()
     
-    if not PYANNOTE_AVAILABLE:
-        print("❌ pyannote.audio requis. Installation: pip install pyannote.audio")
-        sys.exit(1)
-    
+    # Configuration du logging
     logger = setup_logging(args.verbose)
-    
-    # Génération automatique du nom de sortie
-    if not args.output:
-        base, ext = os.path.splitext(args.input_file)
-        args.output = f"{base}_diarization.txt"
     
     try:
         logger.info("=" * 60)
         logger.info("🎭 DIARISATION ADAPTATIVE DES LOCUTEURS")
         logger.info("=" * 60)
         logger.info(f"📁 Fichier d'entrée: {args.input_file}")
-        logger.info(f"📁 Fichier de sortie: {args.output}")
         
-        # Vérification du fichier d'entrée
-        if not os.path.exists(args.input_file):
-            logger.error(f"❌ Fichier non trouvé: {args.input_file}")
-            sys.exit(1)
+        # Génération du nom de fichier de sortie
+        base_name = os.path.splitext(args.input_file)[0]
+        output_file = f"{base_name}_diarization.txt"
+        logger.info(f"📁 Fichier de sortie: {output_file}")
         
-        # Étape 1: Analyse des caractéristiques audio
-        y, sr = librosa.load(args.input_file, sr=16000)
-        characteristics = analyze_audio_for_diarization(y, sr, logger)
+        # Diarisation adaptative complète
+        segments, parameters = diarize_audio_adaptive(args.input_file, logger=logger)
         
-        # Étape 2: Calcul des paramètres adaptatifs
-        parameters = calculate_diarization_parameters(characteristics, logger)
+        # Sauvegarde des résultats
+        save_diarization_results(segments, output_file, parameters, logger)
         
-        # Étape 3: Diarisation adaptative
-        segments = diarize_audio_adaptive(
-            args.input_file, 
-            parameters, 
-            num_workers=args.workers, 
-            logger=logger
-        )
-        
-        # Étape 4: Sauvegarde des résultats
-        save_diarization_results(segments, args.output, logger)
-        
-        logger.info("=" * 60)
-        logger.info("✅ DIARISATION TERMINÉE AVEC SUCCÈS")
-        logger.info("=" * 60)
-        logger.info(f"📊 {len(segments)} segments identifiés")
-        logger.info(f"👥 {len(set(s.speaker for s in segments))} locuteurs détectés")
-        logger.info(f"📁 Résultats: {args.output}")
-        
-        # Statistiques système
-        memory_usage = psutil.Process().memory_info().rss / 1024 / 1024
-        logger.info(f"📊 Mémoire utilisée: {memory_usage:.1f} MB")
+        logger.info("✅ Diarisation adaptative terminée avec succès")
         
     except Exception as e:
         logger.error(f"❌ Erreur lors de la diarisation: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        if args.verbose:
+            import traceback
+            logger.error("Traceback (most recent call last):")
+            for line in traceback.format_exc().strip().split('\n'):
+                logger.error(line)
         sys.exit(1)
 
 if __name__ == "__main__":

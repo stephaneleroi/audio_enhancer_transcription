@@ -16,6 +16,8 @@ from scipy import signal
 from typing import Any, Tuple, Dict, List
 import time
 import psutil
+import json
+from pathlib import Path
 
 def setup_logging(verbose=False):
     """Configure le système de journalisation."""
@@ -516,6 +518,44 @@ def process_audio_adaptive(y: np.ndarray, sr: int, logger=None) -> np.ndarray:
     
     return y_processed
 
+def save_audio_analysis(characteristics: Dict[str, Any], audio_file: str, logger=None):
+    """
+    Sauvegarde l'analyse audio en JSON pour utilisation par d'autres modules.
+    
+    Cette fonction permet de partager les résultats de l'analyse audio
+    avec d'autres composants du pipeline (transcription, diarisation).
+    """
+    try:
+        audio_path = Path(audio_file)
+        analysis_file = audio_path.with_name(f"{audio_path.stem}_analysis.json")
+        
+        # Préparation des données pour JSON (conversion des numpy arrays)
+        json_data = {}
+        for key, value in characteristics.items():
+            if isinstance(value, np.ndarray):
+                json_data[key] = value.tolist()
+            elif isinstance(value, (np.integer, np.floating)):
+                json_data[key] = float(value)
+            else:
+                json_data[key] = value
+        
+        # Ajout de métadonnées
+        json_data['analysis_timestamp'] = time.time()
+        json_data['source_file'] = str(audio_path)
+        
+        with open(analysis_file, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+        
+        if logger:
+            logger.info(f"💾 Analyse sauvegardée: {analysis_file}")
+        
+        return str(analysis_file)
+        
+    except Exception as e:
+        if logger:
+            logger.warning(f"⚠️ Erreur sauvegarde analyse: {e}")
+        return None
+
 def main():
     parser = argparse.ArgumentParser(
         description="Programme d'amélioration audio adaptatif - ZÉRO valeur codée en dur"
@@ -526,6 +566,8 @@ def main():
     parser.add_argument('--verbose', '-v', action='store_true', help='Affichage détaillé')
     parser.add_argument('--target-sr', type=int, default=16000, 
                        help='Fréquence d\'échantillonnage cible (défaut: 16000)')
+    parser.add_argument('--save-analysis', action='store_true', 
+                       help='Sauvegarder l\'analyse audio en JSON')
     
     args = parser.parse_args()
     
@@ -550,6 +592,12 @@ def main():
         logger.info(f"   • Durée: {len(y)/sr:.1f}s")
         logger.info(f"   • Fréquence: {sr} Hz")
         logger.info(f"   • Échantillons: {len(y):,}")
+        
+        # Analyse des caractéristiques (pour sauvegarde optionnelle)
+        if args.save_analysis:
+            logger.info("🔍 Analyse des caractéristiques pour sauvegarde...")
+            characteristics = analyze_audio_characteristics(y, sr, logger)
+            save_audio_analysis(characteristics, args.input_file, logger)
         
         # Traitement adaptatif
         y_enhanced = process_audio_adaptive(y, sr, logger)

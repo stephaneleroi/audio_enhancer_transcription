@@ -1,71 +1,17 @@
 #!/usr/bin/env python3
 """
-Chaîne complète de traitement audio adaptatif :
-Pré-traitement + Transcription + Diarisation des locuteurs
-
-Version adaptative respectant les règles .cursorrules : ZÉRO valeur codée en dur.
-Tous les paramètres sont calculés dynamiquement selon les caractéristiques audio détectées.
+Pipeline complet optimisé : Pré-traitement → Transcription → Diarisation → Alignement
+Avec optimisation intelligente basée sur l'analyse audio partagée
 """
 
 import os
 import sys
 import argparse
 import logging
-import numpy as np
-import librosa
-import soundfile as sf
-from typing import Any, Tuple, Dict, List, Optional
 import time
-import psutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import pickle
-import tempfile
-from dataclasses import dataclass
-from pathlib import Path
 import subprocess
-
-# Import des modules locaux - utilisation via subprocess uniquement
-# from audio_enhancer import enhance_audio_adaptive
-# from transcribe_parallel import transcribe_audio_adaptive  
-# from speaker_diarization import diarize_audio_adaptive, analyze_audio_for_diarization, calculate_diarization_parameters
-
-@dataclass
-class TranscriptionSegment:
-    """Segment de transcription avec timing."""
-    start: float
-    end: float
-    text: str
-    confidence: float = 0.0
-    
-    def duration(self) -> float:
-        return self.end - self.start
-
-@dataclass
-class SpeakerSegment:
-    """Segment de locuteur avec timing."""
-    start: float
-    end: float
-    speaker: str
-    confidence: float = 0.0
-    
-    def duration(self) -> float:
-        return self.end - self.start
-
-@dataclass
-class AlignedSegment:
-    """Segment aligné avec transcription et locuteur."""
-    start: float
-    end: float
-    text: str
-    speaker: str
-    transcription_confidence: float = 0.0
-    speaker_confidence: float = 0.0
-    
-    def duration(self) -> float:
-        return self.end - self.start
-    
-    def __str__(self) -> str:
-        return f"[{self.start:.1f}s - {self.end:.1f}s] {self.speaker}: {self.text}"
+import json
+from pathlib import Path
 
 def setup_logging(verbose=False):
     """Configure le système de journalisation."""
@@ -74,124 +20,248 @@ def setup_logging(verbose=False):
     logger = logging.getLogger()
     logger.setLevel(level)
     
-    # Supprimer les handlers existants pour éviter les doublons
+    # Supprimer les handlers existants
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
     
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(formatter)
-    
     logger.addHandler(console_handler)
     
     return logger
 
-def parse_srt_file(srt_file: str) -> List[TranscriptionSegment]:
+def run_audio_enhancement(input_file: str, logger=None):
     """
-    Objectif : Parse un fichier SRT en segments de transcription
+    Étape 1: Pré-traitement audio adaptatif avec sauvegarde de l'analyse.
     
-    Extrait les segments temporels et le texte depuis un fichier SRT.
+    Cette étape améliore la qualité audio ET sauvegarde l'analyse
+    pour optimiser les étapes suivantes (transcription et diarisation).
     """
+    if logger:
+        logger.info("🔧 ÉTAPE 1: Pré-traitement audio adaptatif")
+    
+    input_path = Path(input_file)
+    enhanced_file = input_path.with_name(f"{input_path.stem}_adaptive_enhanced{input_path.suffix}")
+    
+    # Commande avec sauvegarde de l'analyse
+    cmd = [
+        sys.executable, "audio_enhancer.py",
+        str(input_file),
+        "--output", str(enhanced_file),
+        "--save-analysis",  # NOUVEAU: Sauvegarde l'analyse pour les étapes suivantes
+        "--verbose" if logger and logger.level == logging.DEBUG else ""
+    ]
+    
+    # Filtrer les arguments vides
+    cmd = [arg for arg in cmd if arg]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if logger and logger.level == logging.DEBUG:
+            logger.debug(f"Audio enhancer output: {result.stdout}")
+        
+        return str(enhanced_file)
+        
+    except subprocess.CalledProcessError as e:
+        if logger:
+            logger.error(f"❌ Erreur pré-traitement: {e}")
+            logger.error(f"Stderr: {e.stderr}")
+        return None
+
+def run_adaptive_transcription(audio_file: str, logger=None):
+    """
+    Étape 2: Transcription adaptative parallèle.
+    
+    Utilise le script de transcription parallèle adaptatif qui peut bénéficier
+    de l'analyse audio sauvegardée lors du pré-traitement.
+    """
+    if logger:
+        logger.info("🎤 ÉTAPE 2: Transcription adaptative parallèle")
+    
+    cmd = [
+        sys.executable, "transcribe_parallel.py",
+        audio_file
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if logger and logger.level == logging.DEBUG:
+            logger.debug(f"Transcription output: {result.stdout}")
+        
+        # Le script génère automatiquement le fichier de transcription
+        audio_path = Path(audio_file)
+        transcription_file = audio_path.with_name(f"{audio_path.stem}_adaptive_transcription.txt")
+        
+        if transcription_file.exists():
+            return str(transcription_file)
+        else:
+            if logger:
+                logger.error(f"❌ Fichier de transcription non trouvé: {transcription_file}")
+            return None
+            
+    except subprocess.CalledProcessError as e:
+        if logger:
+            logger.error(f"❌ Erreur transcription: {e}")
+            logger.error(f"Stderr: {e.stderr}")
+        return None
+
+def run_optimized_diarization(audio_file: str, logger=None):
+    """
+    Étape 3: Diarisation optimisée basée sur l'analyse audio.
+    
+    Utilise le script de diarisation amélioré qui charge automatiquement
+    l'analyse audio sauvegardée lors du pré-traitement pour optimiser
+    ses paramètres.
+    """
+    if logger:
+        logger.info("🎭 ÉTAPE 3: Diarisation optimisée")
+    
+    audio_path = Path(audio_file)
+    diarization_file = audio_path.with_name(f"{audio_path.stem}_diarization.txt")
+    
+    cmd = [
+        sys.executable, "speaker_diarization_simple.py",
+        audio_file,
+        "--output", str(diarization_file)
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if logger and logger.level == logging.DEBUG:
+            logger.debug(f"Diarization output: {result.stdout}")
+        
+        if diarization_file.exists():
+            return str(diarization_file)
+        else:
+            if logger:
+                logger.error(f"❌ Fichier de diarisation non trouvé: {diarization_file}")
+            return None
+            
+    except subprocess.CalledProcessError as e:
+        if logger:
+            logger.error(f"❌ Erreur diarisation: {e}")
+            logger.error(f"Stderr: {e.stderr}")
+        return None
+
+def parse_transcription_file(transcription_file: str):
+    """Parse le fichier de transcription pour extraire les segments."""
     segments = []
     
-    with open(srt_file, 'r', encoding='utf-8') as f:
-        content = f.read().strip()
-    
-    # Découpage par blocs (séparés par double saut de ligne)
-    blocks = content.split('\n\n')
-    
-    for block in blocks:
-        lines = block.strip().split('\n')
-        if len(lines) >= 3:
-            # Ligne 2 contient le timing
-            timing_line = lines[1]
-            if ' --> ' in timing_line:
-                start_str, end_str = timing_line.split(' --> ')
-                
-                # Conversion du format SRT (HH:MM:SS,mmm) en secondes
-                def srt_time_to_seconds(time_str):
-                    time_str = time_str.replace(',', '.')
-                    parts = time_str.split(':')
-                    hours = float(parts[0])
-                    minutes = float(parts[1])
-                    seconds = float(parts[2])
-                    return hours * 3600 + minutes * 60 + seconds
-                
-                start = srt_time_to_seconds(start_str.strip())
-                end = srt_time_to_seconds(end_str.strip())
-                
-                # Lignes 3+ contiennent le texte
-                text = ' '.join(lines[2:]).strip()
-                
-                if text:  # Ignorer les segments vides
-                    segment = TranscriptionSegment(
-                        start=start,
-                        end=end,
-                        text=text,
-                        confidence=1.0  # Pas de confiance dans les SRT
-                    )
-                    segments.append(segment)
-    
-    return segments
+    try:
+        with open(transcription_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Recherche des segments dans le format du transcripteur adaptatif
+        lines = content.split('\n')
+        for line in lines:
+            line = line.strip()
+            
+            # Format: "  1. [0m11s - 0m19s]  Texte..."
+            if '[' in line and ']' in line and 'm' in line and 's' in line:
+                try:
+                    # Extraire la partie entre crochets
+                    start_bracket = line.find('[')
+                    end_bracket = line.find(']')
+                    
+                    if start_bracket != -1 and end_bracket != -1:
+                        time_part = line[start_bracket+1:end_bracket]
+                        text_part = line[end_bracket+1:].strip()
+                        
+                        # Parser le timing "0m11s - 0m19s"
+                        if ' - ' in time_part:
+                            start_str, end_str = time_part.split(' - ')
+                            
+                            # Convertir "0m11s" en secondes
+                            def time_to_seconds(time_str):
+                                time_str = time_str.strip()
+                                seconds = 0
+                                
+                                if 'h' in time_str:
+                                    parts = time_str.split('h')
+                                    seconds += int(parts[0]) * 3600
+                                    time_str = parts[1] if len(parts) > 1 else '0m0s'
+                                
+                                if 'm' in time_str:
+                                    parts = time_str.split('m')
+                                    seconds += int(parts[0]) * 60
+                                    time_str = parts[1] if len(parts) > 1 else '0s'
+                                
+                                if 's' in time_str:
+                                    seconds += int(time_str.replace('s', ''))
+                                
+                                return seconds
+                            
+                            start = time_to_seconds(start_str)
+                            end = time_to_seconds(end_str)
+                            
+                            if text_part:  # Ignorer les segments vides
+                                segments.append({
+                                    'start': start,
+                                    'end': end,
+                                    'text': text_part
+                                })
+                except Exception as e:
+                    print(f"Erreur parsing ligne: {line} - {e}")
+                    continue
+        
+        return segments
+        
+    except Exception as e:
+        print(f"Erreur parsing transcription: {e}")
+        return []
 
-def parse_diarization_file(diarization_file: str) -> List[SpeakerSegment]:
-    """
-    Objectif : Parse un fichier de diarisation en segments de locuteurs
+def parse_diarization_file(diarization_file: str):
+    """Parse le fichier de diarisation pour extraire les segments de locuteurs."""
+    speaker_segments = []
     
-    Extrait les segments temporels et les locuteurs depuis un fichier de diarisation.
-    """
-    segments = []
-    
-    with open(diarization_file, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    
-    for line in lines:
-        line = line.strip()
-        # Format: "  1. [0.0s - 0.6s] SPEAKER_01 (conf: 1.000)"
-        if '[' in line and ']' in line and 'SPEAKER_' in line:
-            try:
-                # Extraction du timing entre [ et ]
-                start_bracket = line.find('[')
-                end_bracket = line.find(']')
-                timing_part = line[start_bracket+1:end_bracket]
-                
-                start_str, end_str = timing_part.split(' - ')
-                start = float(start_str.replace('s', ''))
-                end = float(end_str.replace('s', ''))
-                
-                # Extraction du locuteur après ]
-                after_bracket = line[end_bracket+1:].strip()
-                speaker = after_bracket.split(' ')[0]
-                
-                # Extraction de la confiance
-                confidence = 1.0
-                if '(conf:' in after_bracket:
-                    conf_str = after_bracket.split('(conf: ')[1].split(')')[0]
-                    confidence = float(conf_str)
-                
-                segment = SpeakerSegment(
-                    start=start,
-                    end=end,
-                    speaker=speaker,
-                    confidence=confidence
-                )
-                segments.append(segment)
-                
-            except (ValueError, IndexError) as e:
-                continue  # Ignorer les lignes mal formatées
-    
-    return segments
+    try:
+        with open(diarization_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Recherche de la section chronologie
+        lines = content.split('\n')
+        in_chronology = False
+        
+        for line in lines:
+            line = line.strip()
+            
+            if "CHRONOLOGIE COMPLÈTE:" in line:
+                in_chronology = True
+                continue
+            
+            if in_chronology and line and not line.startswith('-'):
+                try:
+                    # Format: "11.0s - 13.5s | SPEAKER_00 (2.5s)"
+                    if ' | ' in line:
+                        time_part, speaker_part = line.split(' | ')
+                        start_str, end_str = time_part.split(' - ')
+                        
+                        start = float(start_str.replace('s', ''))
+                        end = float(end_str.replace('s', ''))
+                        
+                        speaker = speaker_part.split(' ')[0]
+                        
+                        speaker_segments.append({
+                            'start': start,
+                            'end': end,
+                            'speaker': speaker
+                        })
+                except:
+                    continue
+        
+        return speaker_segments
+        
+    except Exception as e:
+        print(f"Erreur parsing diarisation: {e}")
+        return []
 
-def align_transcription_with_speakers(transcription_segments: List[TranscriptionSegment],
-                                    speaker_segments: List[SpeakerSegment],
-                                    logger=None) -> List[AlignedSegment]:
+def align_transcription_with_speakers(transcription_segments, speaker_segments, logger=None):
     """
-    Objectif : Alignement intelligent transcription + diarisation
+    Aligne les segments de transcription avec les locuteurs détectés.
     
-    Aligne les segments de transcription avec les segments de locuteurs
-    en utilisant des algorithmes adaptatifs de chevauchement temporel.
+    Utilise une approche de chevauchement temporel pour associer
+    chaque segment de transcription au locuteur le plus probable.
     """
     if logger:
         logger.info("🔗 Alignement transcription + diarisation...")
@@ -199,274 +269,211 @@ def align_transcription_with_speakers(transcription_segments: List[Transcription
     aligned_segments = []
     
     for trans_seg in transcription_segments:
-        # Trouver le(s) locuteur(s) qui chevauchent avec ce segment de transcription
-        overlapping_speakers = []
+        trans_start = trans_seg['start']
+        trans_end = trans_seg['end']
+        trans_center = (trans_start + trans_end) / 2
+        
+        # Trouver le locuteur avec le plus grand chevauchement
+        best_speaker = "UNKNOWN"
+        best_overlap = 0
         
         for spk_seg in speaker_segments:
-            # Calcul du chevauchement temporel
-            overlap_start = max(trans_seg.start, spk_seg.start)
-            overlap_end = min(trans_seg.end, spk_seg.end)
+            spk_start = spk_seg['start']
+            spk_end = spk_seg['end']
+            
+            # Calcul du chevauchement
+            overlap_start = max(trans_start, spk_start)
+            overlap_end = min(trans_end, spk_end)
             overlap_duration = max(0, overlap_end - overlap_start)
             
-            if overlap_duration > 0:
-                # Calcul du pourcentage de chevauchement
-                trans_coverage = overlap_duration / trans_seg.duration()
-                spk_coverage = overlap_duration / spk_seg.duration()
-                
-                # Score de chevauchement adaptatif
-                overlap_score = (trans_coverage + spk_coverage) / 2
-                
-                overlapping_speakers.append({
-                    'speaker': spk_seg.speaker,
-                    'overlap_duration': overlap_duration,
-                    'overlap_score': overlap_score,
-                    'speaker_confidence': spk_seg.confidence,
-                    'speaker_start': spk_seg.start,
-                    'speaker_end': spk_seg.end
-                })
+            # Normalisation par la durée du segment de transcription
+            trans_duration = trans_end - trans_start
+            overlap_ratio = overlap_duration / trans_duration if trans_duration > 0 else 0
+            
+            if overlap_ratio > best_overlap:
+                best_overlap = overlap_ratio
+                best_speaker = spk_seg['speaker']
         
-        if overlapping_speakers:
-            # Tri par score de chevauchement décroissant
-            overlapping_speakers.sort(key=lambda x: x['overlap_score'], reverse=True)
-            
-            # Sélection du meilleur locuteur
-            best_speaker = overlapping_speakers[0]
-            
-            # Création du segment aligné
-            aligned_segment = AlignedSegment(
-                start=trans_seg.start,
-                end=trans_seg.end,
-                text=trans_seg.text,
-                speaker=best_speaker['speaker'],
-                transcription_confidence=trans_seg.confidence,
-                speaker_confidence=best_speaker['speaker_confidence']
-            )
-            aligned_segments.append(aligned_segment)
-            
-        else:
-            # Aucun locuteur trouvé, utiliser un locuteur par défaut
-            aligned_segment = AlignedSegment(
-                start=trans_seg.start,
-                end=trans_seg.end,
-                text=trans_seg.text,
-                speaker="SPEAKER_UNKNOWN",
-                transcription_confidence=trans_seg.confidence,
-                speaker_confidence=0.0
-            )
-            aligned_segments.append(aligned_segment)
+        # Si aucun chevauchement significatif, utiliser le locuteur le plus proche
+        if best_overlap < 0.1:
+            min_distance = float('inf')
+            for spk_seg in speaker_segments:
+                spk_center = (spk_seg['start'] + spk_seg['end']) / 2
+                distance = abs(trans_center - spk_center)
+                if distance < min_distance:
+                    min_distance = distance
+                    best_speaker = spk_seg['speaker']
+        
+        aligned_segments.append({
+            'start': trans_start,
+            'end': trans_end,
+            'text': trans_seg['text'],
+            'speaker': best_speaker,
+            'confidence': best_overlap
+        })
     
     if logger:
         logger.info(f"✅ {len(aligned_segments)} segments alignés")
-        
-        # Statistiques d'alignement
-        speaker_counts = {}
-        for seg in aligned_segments:
-            speaker_counts[seg.speaker] = speaker_counts.get(seg.speaker, 0) + 1
-        
-        logger.info("📊 Répartition par locuteur :")
-        for speaker, count in sorted(speaker_counts.items()):
-            total_duration = sum(seg.duration() for seg in aligned_segments if seg.speaker == speaker)
-            logger.info(f"   • {speaker}: {count} segments ({total_duration:.1f}s)")
     
     return aligned_segments
 
-def save_aligned_results(aligned_segments: List[AlignedSegment], output_file: str, logger=None):
-    """
-    Objectif : Sauvegarde des résultats alignés
+def save_aligned_results(aligned_segments, output_base: str, logger=None):
+    """Sauvegarde les résultats alignés en format texte et SRT."""
     
-    Sauvegarde les segments alignés dans différents formats.
-    """
-    if logger:
-        logger.info(f"💾 Sauvegarde des résultats alignés: {output_file}")
+    # Fichier texte
+    txt_file = f"{output_base}_complete_transcription.txt"
+    with open(txt_file, 'w', encoding='utf-8') as f:
+        f.write("TRANSCRIPTION COMPLÈTE AVEC LOCUTEURS\n")
+        f.write("=" * 50 + "\n\n")
+        
+        for seg in aligned_segments:
+            f.write(f"{seg['start']:7.1f}s - {seg['end']:7.1f}s | {seg['speaker']}\n")
+            f.write(f"  {seg['text']}\n\n")
     
-    # Format texte détaillé
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("TRANSCRIPTION AVEC DIARISATION ADAPTATIVE\n")
-        f.write("=" * 60 + "\n\n")
-        
-        for i, segment in enumerate(aligned_segments, 1):
-            f.write(f"{i:3d}. {segment}\n")
-        
-        f.write(f"\n📊 STATISTIQUES:\n")
-        f.write(f"   • Segments totaux: {len(aligned_segments)}\n")
-        
-        # Statistiques par locuteur
-        speaker_stats = {}
-        for segment in aligned_segments:
-            if segment.speaker not in speaker_stats:
-                speaker_stats[segment.speaker] = {'duration': 0, 'segments': 0, 'words': 0}
-            speaker_stats[segment.speaker]['duration'] += segment.duration()
-            speaker_stats[segment.speaker]['segments'] += 1
-            speaker_stats[segment.speaker]['words'] += len(segment.text.split())
-        
-        f.write(f"   • Locuteurs uniques: {len(speaker_stats)}\n")
-        f.write(f"   • Durée totale: {max(s.end for s in aligned_segments):.1f}s\n")
-        
-        f.write(f"\n👥 STATISTIQUES PAR LOCUTEUR:\n")
-        for speaker, stats in sorted(speaker_stats.items()):
-            f.write(f"   • {speaker}: {stats['duration']:.1f}s, {stats['segments']} segments, {stats['words']} mots\n")
-    
-    # Format SRT avec locuteurs
-    srt_file = output_file.replace('.txt', '_with_speakers.srt')
+    # Fichier SRT
+    srt_file = f"{output_base}_complete_transcription_with_speakers.srt"
     with open(srt_file, 'w', encoding='utf-8') as f:
-        for i, segment in enumerate(aligned_segments, 1):
-            # Conversion en format SRT
-            def seconds_to_srt_time(seconds):
-                hours = int(seconds // 3600)
-                minutes = int((seconds % 3600) // 60)
-                secs = seconds % 60
-                return f"{hours:02d}:{minutes:02d}:{secs:06.3f}".replace('.', ',')
-            
-            start_time = seconds_to_srt_time(segment.start)
-            end_time = seconds_to_srt_time(segment.end)
+        for i, seg in enumerate(aligned_segments, 1):
+            start_time = format_srt_time(seg['start'])
+            end_time = format_srt_time(seg['end'])
             
             f.write(f"{i}\n")
             f.write(f"{start_time} --> {end_time}\n")
-            f.write(f"[{segment.speaker}] {segment.text}\n\n")
+            f.write(f"[{seg['speaker']}] {seg['text']}\n\n")
     
     if logger:
-        logger.info(f"📁 Fichiers sauvegardés: {output_file} et {srt_file}")
+        logger.info(f"💾 Sauvegarde des résultats alignés: {txt_file}")
+        logger.info(f"📁 Fichiers sauvegardés: {txt_file} et {srt_file}")
+    
+    return txt_file, srt_file
 
-def process_complete_pipeline(input_file: str, output_base: str, num_workers: int = 4, logger=None):
-    """
-    Objectif : Pipeline complet de traitement adaptatif
+def format_srt_time(seconds):
+    """Formate le temps en format SRT (HH:MM:SS,mmm)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
     
-    Exécute la chaîne complète : pré-traitement → transcription → diarisation → alignement
-    """
-    if logger:
-        logger.info("🚀 DÉBUT DU PIPELINE COMPLET ADAPTATIF")
-        logger.info("=" * 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+def get_speaker_statistics(aligned_segments):
+    """Calcule les statistiques par locuteur."""
+    speaker_stats = {}
+    
+    for seg in aligned_segments:
+        speaker = seg['speaker']
+        duration = seg['end'] - seg['start']
+        
+        if speaker not in speaker_stats:
+            speaker_stats[speaker] = {
+                'segments': 0,
+                'total_time': 0.0
+            }
+        
+        speaker_stats[speaker]['segments'] += 1
+        speaker_stats[speaker]['total_time'] += duration
+    
+    return speaker_stats
+
+def main():
+    """Pipeline complet optimisé."""
+    parser = argparse.ArgumentParser(description="Pipeline complet avec optimisation basée sur l'analyse audio")
+    parser.add_argument("input_file", help="Fichier audio à traiter")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Mode verbeux")
+    parser.add_argument("--skip-enhancement", action="store_true", help="Ignorer le pré-traitement")
+    
+    args = parser.parse_args()
+    
+    logger = setup_logging(args.verbose)
     
     start_time = time.time()
     
-    # Étape 1: Pré-traitement audio adaptatif
-    if logger:
-        logger.info("🔧 ÉTAPE 1: Pré-traitement audio adaptatif")
+    logger.info("🚀 DÉBUT DU PIPELINE COMPLET OPTIMISÉ")
+    logger.info("=" * 60)
     
-    enhanced_file = f"{output_base}_enhanced.wav"
-    
-    # Appel du module de pré-traitement
-    cmd = [sys.executable, "audio_enhancer.py", input_file, "--output", enhanced_file]
-    if logger and logger.level == logging.DEBUG:
-        cmd.append("--verbose")
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        if logger:
-            logger.error(f"❌ Erreur pré-traitement: {result.stderr}")
-        return False
-    
-    # Étape 2: Transcription adaptative
-    if logger:
-        logger.info("🎤 ÉTAPE 2: Transcription adaptative")
-    
-    # Appel du module de transcription
-    cmd = [sys.executable, "transcribe_parallel.py", enhanced_file]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        if logger:
-            logger.error(f"❌ Erreur transcription: {result.stderr}")
-        return False
-    
-    transcription_file = enhanced_file.replace('.wav', '_adaptive_subtitles.srt')
-    
-    # Étape 3: Diarisation adaptative
-    if logger:
-        logger.info("🎭 ÉTAPE 3: Diarisation adaptative")
-    
-    diarization_file = f"{output_base}_diarization.txt"
-    
-    # Appel du module de diarisation
-    cmd = [sys.executable, "speaker_diarization.py", enhanced_file, "--output", diarization_file, "--workers", str(num_workers)]
-    if logger and logger.level == logging.DEBUG:
-        cmd.append("--verbose")
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        if logger:
-            logger.error(f"❌ Erreur diarisation: {result.stderr}")
-        return False
-    
-    # Étape 4: Alignement et fusion
-    if logger:
+    try:
+        # Étape 1: Pré-traitement audio avec sauvegarde de l'analyse
+        if not args.skip_enhancement:
+            enhanced_file = run_audio_enhancement(args.input_file, logger)
+            if not enhanced_file:
+                logger.error("❌ Échec du pré-traitement")
+                return 1
+            audio_file = enhanced_file
+        else:
+            audio_file = args.input_file
+            logger.info("⏭️ Pré-traitement ignoré")
+        
+        # Étape 2: Transcription adaptative
+        transcription_file = run_adaptive_transcription(audio_file, logger)
+        if not transcription_file:
+            logger.error("❌ Échec de la transcription")
+            return 1
+        
+        # Étape 3: Diarisation optimisée (utilise automatiquement l'analyse sauvegardée)
+        diarization_file = run_optimized_diarization(audio_file, logger)
+        if not diarization_file:
+            logger.error("❌ Échec de la diarisation")
+            return 1
+        
+        # Étape 4: Alignement
         logger.info("🔗 ÉTAPE 4: Alignement transcription + diarisation")
-    
-    # Parse des résultats
-    transcription_segments = parse_srt_file(transcription_file)
-    speaker_segments = parse_diarization_file(diarization_file)
-    
-    # Alignement
-    aligned_segments = align_transcription_with_speakers(
-        transcription_segments, 
-        speaker_segments, 
-        logger
-    )
-    
-    # Sauvegarde des résultats finaux
-    final_output = f"{output_base}_complete_transcription.txt"
-    save_aligned_results(aligned_segments, final_output, logger)
-    
-    # Statistiques finales
-    total_time = time.time() - start_time
-    memory_usage = psutil.Process().memory_info().rss / 1024 / 1024
-    
-    if logger:
+        
+        transcription_segments = parse_transcription_file(transcription_file)
+        speaker_segments = parse_diarization_file(diarization_file)
+        
+        if not transcription_segments:
+            logger.error("❌ Aucun segment de transcription trouvé")
+            return 1
+        
+        if not speaker_segments:
+            logger.error("❌ Aucun segment de locuteur trouvé")
+            return 1
+        
+        aligned_segments = align_transcription_with_speakers(
+            transcription_segments, speaker_segments, logger
+        )
+        
+        # Sauvegarde des résultats
+        input_path = Path(args.input_file)
+        output_base = input_path.stem
+        
+        txt_file, srt_file = save_aligned_results(aligned_segments, output_base, logger)
+        
+        # Statistiques finales
+        speaker_stats = get_speaker_statistics(aligned_segments)
+        total_time = time.time() - start_time
+        
         logger.info("=" * 60)
         logger.info("✅ PIPELINE COMPLET TERMINÉ AVEC SUCCÈS")
         logger.info("=" * 60)
         logger.info(f"📊 Segments transcrits: {len(transcription_segments)}")
         logger.info(f"🎭 Segments de locuteurs: {len(speaker_segments)}")
         logger.info(f"🔗 Segments alignés: {len(aligned_segments)}")
-        logger.info(f"👥 Locuteurs détectés: {len(set(s.speaker for s in aligned_segments))}")
+        logger.info(f"👥 Locuteurs détectés: {len(speaker_stats)}")
+        
+        logger.info("📊 Répartition par locuteur :")
+        for speaker, stats in speaker_stats.items():
+            logger.info(f"   • {speaker}: {stats['segments']} segments ({stats['total_time']:.1f}s)")
+        
         logger.info(f"⏱️ Temps total: {total_time:.1f}s")
-        logger.info(f"📊 Mémoire utilisée: {memory_usage:.1f} MB")
-        logger.info(f"📁 Résultat final: {final_output}")
-    
-    return True
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Pipeline complet adaptatif : Pré-traitement + Transcription + Diarisation"
-    )
-    
-    parser.add_argument('input_file', help='Fichier audio à traiter')
-    parser.add_argument('--output', '-o', help='Préfixe des fichiers de sortie (optionnel)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Affichage détaillé')
-    parser.add_argument('--workers', '-w', type=int, default=4, 
-                       help='Nombre de workers parallèles (défaut: 4)')
-    
-    args = parser.parse_args()
-    
-    logger = setup_logging(args.verbose)
-    
-    # Génération automatique du préfixe de sortie
-    if not args.output:
-        base, ext = os.path.splitext(args.input_file)
-        args.output = base
-    
-    try:
-        # Vérification du fichier d'entrée
-        if not os.path.exists(args.input_file):
-            logger.error(f"❌ Fichier non trouvé: {args.input_file}")
-            sys.exit(1)
         
-        # Exécution du pipeline complet
-        success = process_complete_pipeline(
-            args.input_file,
-            args.output,
-            num_workers=args.workers,
-            logger=logger
-        )
+        # Mémoire utilisée
+        try:
+            import psutil
+            memory_usage = psutil.Process().memory_info().rss / 1024 / 1024
+            logger.info(f"📊 Mémoire utilisée: {memory_usage:.1f} MB")
+        except ImportError:
+            pass
         
-        if not success:
-            logger.error("❌ Échec du pipeline")
-            sys.exit(1)
-            
+        logger.info(f"📁 Résultat final: {txt_file}")
+        
+        return 0
+        
     except Exception as e:
-        logger.error(f"❌ Erreur lors du traitement: {str(e)}")
+        logger.error(f"❌ Erreur dans le pipeline: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
-        sys.exit(1)
+        return 1
 
 if __name__ == "__main__":
-    main() 
+    sys.exit(main()) 
