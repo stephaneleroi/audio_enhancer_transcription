@@ -1,0 +1,187 @@
+# RÈGLES CURSOR - PROJET TRANSCRIPTION ADAPTATIVE
+# ================================================
+
+## 🚫 RÈGLE FONDAMENTALE : ZÉRO VALEUR CODÉE EN DUR
+### Tous les paramètres DOIVENT être calculés et découverts automatiquement
+
+### ❌ INTERDICTIONS ABSOLUES :
+- Aucune valeur numérique codée en dur dans les algorithmes
+- Aucun seuil fixe (threshold, silence_duration, speech_pad)
+- Aucune constante magique sans justification calculée
+- Aucun paramètre basé sur des suppositions ou des "bonnes pratiques"
+
+### ✅ OBLIGATIONS :
+- Tous les paramètres doivent être calculés à partir de l'analyse audio
+- Utiliser des formules adaptatives basées sur les caractéristiques détectées
+- Implémenter des systèmes d'équilibrage et de normalisation
+- Ajouter des bornes de sécurité calculées, pas arbitraires
+
+## 📊 MÉTHODOLOGIE ADAPTATIVE OBLIGATOIRE
+
+### 1. ANALYSE AUDIO PRÉALABLE
+- Analyser l'énergie, la dynamique, le spectre, les silences
+- Calculer des statistiques robustes (percentiles, moyennes pondérées)
+- Déduire les caractéristiques du contenu audio
+
+### 2. CALCUL DES PARAMÈTRES DE BASE
+- Formules mathématiques basées sur les caractéristiques
+- Normalisation et équilibrage automatiques
+- Éviter les valeurs extrêmes par des fonctions de lissage
+
+### 3. GÉNÉRATION DE CANDIDATS
+- Variations calculées autour des valeurs de base
+- Combinaisons systématiques testables
+- Scoring objectif pour sélection automatique
+
+### 4. VALIDATION ET BORNES
+- Bornes de sécurité dérivées des caractéristiques audio
+- Tests de cohérence entre paramètres
+- Prévention des configurations absurdes
+
+## 🧮 EXEMPLES DE CALCULS ADAPTATIFS CORRECTS
+
+### Seuil VAD :
+```python
+# ✅ CORRECT - Calculé selon l'énergie
+energy_factor = np.sqrt(mean_energy / reference_energy)
+base_threshold = reference_base * energy_factor
+```
+
+### Durée de silence :
+```python
+# ✅ CORRECT - Basé sur les percentiles détectés
+silence_stats = np.percentile(detected_silences, [25, 50, 75])
+base_silence = int(0.3 * p25 + 0.5 * p50 + 0.2 * p75)
+```
+
+### Speech padding :
+```python
+# ✅ CORRECT - Adapté à la qualité spectrale
+spectral_factor = spectral_centroid / spectral_reference
+base_padding = int(base_value + (spectral_factor - 1.0) * adaptive_range)
+```
+
+## 🚫 EXEMPLES INTERDITS
+
+```python
+# ❌ INTERDIT - Valeurs codées en dur
+threshold = 0.4
+silence_duration = 200
+speech_pad = 150
+
+# ❌ INTERDIT - Conditions arbitraires
+if mean_energy > 0.05:
+    threshold = 0.5
+elif mean_energy > 0.02:
+    threshold = 0.4
+
+# ❌ INTERDIT - Constantes magiques
+candidates = [
+    {'threshold': 0.3, 'silence': 150},  # D'où viennent ces valeurs ?
+    {'threshold': 0.4, 'silence': 200},
+]
+```
+
+## 🎯 SYSTÈME DE SCORING ADAPTATIF
+
+### Critères de qualité calculés :
+- Nombre de segments (plus = mieux, sauf sur-segmentation)
+- Confiance moyenne (plus haute = mieux)
+- Distribution des durées (équilibrée = mieux)
+- Pénalités pour segments trop longs/courts
+
+### Fonction de scoring composite :
+```python
+# ✅ Scoring entièrement calculé
+base_score = segments_count * weight1 + confidence * weight2 + balance * weight3
+final_score = base_score - penalties
+```
+
+## 🔧 RÈGLES D'AJUSTEMENT DYNAMIQUE
+
+### Adaptation par chunk :
+- Calculs basés sur les ratios énergétiques
+- Ajustements proportionnels aux caractéristiques
+- Facteurs d'adaptation calculés, jamais fixes
+
+### Équilibrage automatique :
+- Prévention des valeurs extrêmes par des fonctions mathématiques
+- Lissage par racines carrées ou logarithmes
+- Bornes calculées selon les caractéristiques globales
+
+## 📝 DOCUMENTATION OBLIGATOIRE
+
+### Pour chaque paramètre calculé :
+- Expliquer la formule utilisée
+- Justifier les facteurs de pondération
+- Documenter les bornes de sécurité
+- Indiquer les références utilisées pour la normalisation
+
+### Exemple de documentation :
+```python
+# Calcul du seuil adaptatif :
+# - energy_factor = normalisation de l'énergie par rapport à 0.05 (énergie de référence parole normale)
+# - dynamic_factor = prise en compte de la plage dynamique (0.15 = référence conversation)
+# - base_threshold centré sur 0.2 (valeur d'équilibre empirique)
+# - bornes [0.15, 0.65] pour éviter sur/sous-détection
+```
+
+## 🧪 TESTS ET VALIDATION
+
+### Vérifications automatiques :
+- Tests sur différents types d'audio
+- Validation des plages de paramètres
+- Comparaison avec références connues
+- Détection des régressions de performance
+
+### Métriques de qualité :
+- Pourcentage de segments par rapport à la référence
+- Temps de traitement
+- Confiance moyenne
+- Robustesse sur différents fichiers
+
+## 🎛️ CONFIGURATION ADAPTATIVE
+
+### Structure des paramètres :
+```python
+# ✅ Structure adaptative complète
+adaptive_config = {
+    'base_calculations': {
+        'energy_reference': calculated_from_training_set,
+        'spectral_reference': calculated_from_analysis,
+        'silence_percentiles': [25, 50, 75]
+    },
+    'adaptation_factors': {
+        'energy_smoothing': 'sqrt',  # Fonction de lissage
+        'dynamic_range_factor': calculated_coefficient,
+        'spectral_weight': calculated_weight
+    },
+    'safety_bounds': {
+        'threshold_min': calculated_minimum,
+        'threshold_max': calculated_maximum,
+        'silence_min': calculated_from_duration,
+        'silence_max': calculated_from_characteristics
+    }
+}
+```
+
+## 🔍 CONTRÔLE QUALITÉ
+
+### Avant chaque commit :
+1. Vérifier qu'aucune valeur n'est codée en dur
+2. S'assurer que tous les paramètres sont calculés
+3. Valider les formules d'adaptation
+4. Tester sur plusieurs fichiers audio différents
+
+### Code review checklist :
+- [ ] Aucune constante magique
+- [ ] Formules documentées et justifiées
+- [ ] Paramètres adaptatifs basés sur l'analyse
+- [ ] Bornes de sécurité calculées
+- [ ] Tests de robustesse inclus
+
+## 💡 PHILOSOPHIE DU PROJET
+
+**"Un système vraiment intelligent découvre ses paramètres optimaux, il ne les suppose pas."**
+
+Le but est de créer un système de transcription qui s'adapte automatiquement à n'importe quel type d'audio, sans intervention humaine ni ajustement manuel. Chaque paramètre doit être le résultat d'un calcul justifié, pas d'une supposition ou d'une valeur "qui marche bien en général". 
