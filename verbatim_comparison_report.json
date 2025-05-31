@@ -1,0 +1,30 @@
+{
+  "timestamp": "2025-05-31T09:38:13.555893",
+  "our_system": {
+    "name": "Notre système adaptatif (transcribe_parallel.py)",
+    "total_segments": 355,
+    "avg_confidence": -0.227,
+    "processing_time": 489,
+    "speakers_expected": 5,
+    "adaptations": "4/32 chunks (12.5%)",
+    "technology": "Faster Whisper Large-V3 + VAD adaptatif"
+  },
+  "verbatim_system": {
+    "name": "Verbatim",
+    "technology": "Faster Whisper Large-V3 + PyAnnote + Demucs",
+    "total_segments": 174,
+    "avg_confidence": 0,
+    "speakers_detected": 5,
+    "speakers_list": [
+      "SPEAKER_00",
+      "SPEAKER_01",
+      "SPEAKER_02",
+      "SPEAKER_03",
+      "SPEAKER_04"
+    ],
+    "total_duration": 944.04781,
+    "processing_time": 838.2232689857483,
+    "confidence_count": 0
+  },
+  "file_tested": "gros_adaptive_enhanced.mp3"
+}
